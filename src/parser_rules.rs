@@ -12,7 +12,7 @@ const EXTRA_DIRS: &[&str] = &[
     "cds", "scans", "fonts", "ncop&nced", "ncop", "nced", "pv", "pvs",
     "menu", "menus", "previews", "preview", "music", "ost", "图集", "做饭",
     "变身&技能 合集", "舞蹈", "谈话", "sps", "sp", "extras", "extra",
-    "特典映像", "特典", "总集篇", "广播剧", "特别动画", "影家剧场", "小菜一碟",
+    "特典映像", "特典", "总集篇", "广播剧", "特别动画", "影家剧场", "小菜一碟", "爆炸",
     "sample", "samples", "trailers", "trailer", "featurettes",
 ];
 
@@ -392,6 +392,15 @@ pub fn detect_season(rel_parts: &[String], fname: &str, root_folder_name: &str) 
     1
 }
 
+/// Return true when filename itself contains an explicit `SxxExx` tag.
+pub fn has_explicit_sxe_season(fname: &str) -> bool {
+    static RE_SXE: OnceLock<Regex> = OnceLock::new();
+    let re_sxe = RE_SXE.get_or_init(|| {
+        Regex::new(r"(?i)(?:^|[^A-Za-z])S0*\d{1,2}E\d{1,4}(?:\.\d)?(?:v\d+)?(?:[^A-Za-z0-9]|$)").unwrap()
+    });
+    re_sxe.is_match(fname)
+}
+
 fn is_plausible_ep(ep_str: &str) -> bool {
     let head = ep_str.split('.').next().unwrap_or("");
     let val: i32 = match head.parse() {
@@ -541,6 +550,7 @@ pub fn build_multi_folder_items(
     archive_extras: bool,
     extras_root_dir: Option<&Path>,
     season_override: Option<i32>,
+    apply_continuous_offset: bool,
 ) -> (Vec<RenameItem>, Vec<String>) {
     static RE_YEAR_SUFFIX: OnceLock<Regex> = OnceLock::new();
     let safe_folder = sanitize_filename(target_folder_name, 160);
@@ -636,7 +646,7 @@ pub fn build_multi_folder_items(
                     forced_s
                 } else {
                     let mut detected = detect_season(&parts, &fname, &src_folder_name);
-                    if ep.contains('.') {
+                    if ep.contains('.') && !has_explicit_sxe_season(&fname) {
                         detected = 0;
                     }
                     detected
@@ -657,14 +667,16 @@ pub fn build_multi_folder_items(
             }
         }
         let mut offsets: HashMap<i32, i32> = HashMap::new();
-        let mut prev_max = 0;
-        for (s, eps) in &season_eps {
-            let mn = *eps.iter().min().unwrap_or(&0);
-            let mx = *eps.iter().max().unwrap_or(&0);
-            if *s > 1 && prev_max > 0 && mn == prev_max + 1 {
-                offsets.insert(*s, prev_max);
+        if apply_continuous_offset {
+            let mut prev_max = 0;
+            for (s, eps) in &season_eps {
+                let mn = *eps.iter().min().unwrap_or(&0);
+                let mx = *eps.iter().max().unwrap_or(&0);
+                if *s > 1 && prev_max > 0 && mn == prev_max + 1 {
+                    offsets.insert(*s, prev_max);
+                }
+                prev_max = mx;
             }
-            prev_max = mx;
         }
 
         for (src_path, s, ep, part_tag, full_ext) in raw_tv {
@@ -700,6 +712,251 @@ pub fn build_multi_folder_items(
 
     let cols = find_item_collisions(&items);
     (items, cols)
+}
+
+/// Align multi-season episode numbers and drifted seasons using TMDB metadata:
+/// - For seasonal TMDB series (seasons starting at E01), subtracts continuous absolute offsets
+///   when local Season 2+ continues from Season 1's max episode.
+/// - For continuous-numbered TMDB series (e.g. One Piece where S02 starts at 62, S21 starts at 892),
+///   keeps continuous episode numbers intact and relocates episodes whose local Season folder drifted
+///   into the unique matching TMDB Season.
+pub fn reconcile_tv_episodes<FS, FE>(
+    items: Vec<RenameItem>,
+    mut seasons_fetcher: FS,
+    mut season_fetcher: FE,
+    tmdb_id: i64,
+) -> (Vec<RenameItem>, Vec<String>, Option<String>)
+where
+    FS: FnMut(i64) -> Result<HashMap<i32, String>, String>,
+    FE: FnMut(i64, i32) -> Result<HashMap<i32, String>, String>,
+{
+    if tmdb_id == 0 {
+        let cols = find_item_collisions(&items);
+        return (items, cols, None);
+    }
+
+    static RE_TOK: OnceLock<Regex> = OnceLock::new();
+    let re_tok = RE_TOK.get_or_init(|| Regex::new(r"S(\d{2})E(\d{2,4})(\.\d)?").unwrap());
+
+    struct ParsedTok {
+        start: usize,
+        end: usize,
+        s_num: i32,
+        ep_int: i32,
+        dec: String,
+    }
+
+    let mut local_seasons: BTreeSet<i32> = BTreeSet::new();
+    let mut season_eps: BTreeMap<i32, Vec<i32>> = BTreeMap::new();
+    let mut parsed: Vec<(RenameItem, Option<ParsedTok>)> = Vec::with_capacity(items.len());
+
+    for it in items {
+        let mut hit = None;
+        if it.kind == ItemKind::Main {
+            if let Some(bn) = it.dst.file_name().and_then(|s| s.to_str()) {
+                if let Some(c) = re_tok.captures(bn) {
+                    let full = c.get(0).unwrap();
+                    if let (Ok(s_num), Ok(ep_int)) = (c[1].parse::<i32>(), c[2].parse::<i32>()) {
+                        let dec = c.get(3).map(|m| m.as_str().to_string()).unwrap_or_default();
+                        if s_num >= 1 {
+                            local_seasons.insert(s_num);
+                            if dec.is_empty() {
+                                season_eps.entry(s_num).or_default().push(ep_int);
+                            }
+                        }
+                        hit = Some(ParsedTok {
+                            start: full.start(),
+                            end: full.end(),
+                            s_num,
+                            ep_int,
+                            dec,
+                        });
+                    }
+                }
+            }
+        }
+        parsed.push((it, hit));
+    }
+
+    if local_seasons.is_empty() {
+        let out: Vec<RenameItem> = parsed.into_iter().map(|(it, _)| it).collect();
+        let cols = find_item_collisions(&out);
+        return (out, cols, None);
+    }
+
+    let tmdb_seasons: Vec<i32> = match seasons_fetcher(tmdb_id) {
+        Ok(map) => {
+            let mut ks: Vec<i32> = map.keys().copied().filter(|&k| k > 0).collect();
+            ks.sort_unstable();
+            ks
+        }
+        Err(_) => {
+            let out: Vec<RenameItem> = parsed.into_iter().map(|(it, _)| it).collect();
+            let cols = find_item_collisions(&out);
+            return (out, cols, None);
+        }
+    };
+
+    let mut tmdb_ep_maps: HashMap<i32, HashMap<i32, String>> = HashMap::new();
+    let mut warnings: Vec<String> = Vec::new();
+
+    for &s_num in &local_seasons {
+        if tmdb_seasons.contains(&s_num) {
+            match season_fetcher(tmdb_id, s_num) {
+                Ok(m) => {
+                    tmdb_ep_maps.insert(s_num, m);
+                }
+                Err(e) => warnings.push(format!("Season {:02} 集列表获取失败: {}", s_num, e)),
+            }
+        }
+    }
+
+    // Peek Season 02 if needed to tell continuous long-running shows apart from 1-based seasonal shows.
+    if !tmdb_ep_maps.contains_key(&2) && tmdb_seasons.contains(&2) {
+        let has_miss_in_s1 = parsed.iter().any(|(_, h)| {
+            h.as_ref()
+                .map(|p| {
+                    p.s_num == 1
+                        && !tmdb_ep_maps
+                            .get(&1)
+                            .map(|m| m.contains_key(&p.ep_int))
+                            .unwrap_or(false)
+                })
+                .unwrap_or(false)
+        });
+        if has_miss_in_s1 {
+            if let Ok(m) = season_fetcher(tmdb_id, 2) {
+                tmdb_ep_maps.insert(2, m);
+            }
+        }
+    }
+
+    let tmdb_is_continuous = tmdb_ep_maps
+        .iter()
+        .any(|(&ts, m)| ts > 1 && m.keys().copied().min().unwrap_or(1) > 1);
+
+    let mut offsets: HashMap<i32, i32> = HashMap::new();
+    let mut relocations: HashMap<(i32, i32), i32> = HashMap::new();
+
+    if !tmdb_is_continuous {
+        let mut prev_max = 0;
+        for (s, eps) in &season_eps {
+            let mn = *eps.iter().min().unwrap_or(&0);
+            let mx = *eps.iter().max().unwrap_or(&0);
+            if *s > 1 && prev_max > 0 && mn == prev_max + 1 {
+                if let Some(m) = tmdb_ep_maps.get(s) {
+                    if m.contains_key(&(mn - prev_max)) && !m.contains_key(&mn) {
+                        offsets.insert(*s, prev_max);
+                    }
+                }
+            }
+            prev_max = mx;
+        }
+    } else {
+        let has_missing = parsed.iter().any(|(_, h)| {
+            h.as_ref()
+                .map(|p| {
+                    p.s_num >= 1
+                        && !tmdb_ep_maps
+                            .get(&p.s_num)
+                            .map(|m| m.contains_key(&p.ep_int))
+                            .unwrap_or(false)
+                })
+                .unwrap_or(false)
+        });
+        if has_missing {
+            for &ts in &tmdb_seasons {
+                if !tmdb_ep_maps.contains_key(&ts) {
+                    if let Ok(m) = season_fetcher(tmdb_id, ts) {
+                        tmdb_ep_maps.insert(ts, m);
+                    }
+                }
+            }
+            let mut ep_to_seasons: HashMap<i32, Vec<i32>> = HashMap::new();
+            for (&ts, m) in &tmdb_ep_maps {
+                if ts > 0 {
+                    for &ep_n in m.keys() {
+                        ep_to_seasons.entry(ep_n).or_default().push(ts);
+                    }
+                }
+            }
+            for (_, hit) in &parsed {
+                if let Some(p) = hit {
+                    if p.s_num >= 1 {
+                        let ok_in_cur = tmdb_ep_maps
+                            .get(&p.s_num)
+                            .map(|m| m.contains_key(&p.ep_int))
+                            .unwrap_or(false);
+                        if !ok_in_cur {
+                            if let Some(cands) = ep_to_seasons.get(&p.ep_int) {
+                                if cands.len() == 1 {
+                                    relocations.insert((p.s_num, p.ep_int), cands[0]);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut out = Vec::with_capacity(parsed.len());
+    for (it, hit) in parsed {
+        if let Some(p) = hit {
+            let new_s = relocations.get(&(p.s_num, p.ep_int)).copied().unwrap_or(p.s_num);
+            let new_ep = if p.dec.is_empty() {
+                if let Some(&off) = offsets.get(&new_s) {
+                    (p.ep_int - off).max(1)
+                } else {
+                    p.ep_int
+                }
+            } else {
+                p.ep_int
+            };
+
+            if new_s != p.s_num || new_ep != p.ep_int {
+                let bn = it.dst.file_name().unwrap().to_string_lossy();
+                let new_tok = format!("S{:02}E{:02}{}", new_s, new_ep, p.dec);
+                let new_bn = format!("{}{}{}", &bn[..p.start], new_tok, &bn[p.end..]);
+
+                let old_s_folder = format!("Season {:02}", p.s_num);
+                let new_s_folder = format!("Season {:02}", new_s);
+                let new_dst = match (
+                    it.dst.parent(),
+                    it.dst.parent().and_then(|d| d.parent()),
+                    it.dst.parent().and_then(|d| d.file_name()).and_then(|s| s.to_str()),
+                ) {
+                    (Some(_), Some(show_root), Some(sf)) if sf == old_s_folder => {
+                        show_root.join(new_s_folder).join(&new_bn)
+                    }
+                    (Some(dir), _, _) => dir.join(&new_bn),
+                    _ => PathBuf::from(&new_bn),
+                };
+
+                out.push(RenameItem {
+                    src: it.src,
+                    dst: new_dst,
+                    kind: it.kind,
+                });
+                continue;
+            }
+        }
+        out.push(it);
+    }
+
+    out.sort_by(|a, b| {
+        let ka = if a.kind == ItemKind::Main { 0 } else { 1 };
+        let kb = if b.kind == ItemKind::Main { 0 } else { 1 };
+        (ka, a.dst.to_string_lossy().to_string()).cmp(&(kb, b.dst.to_string_lossy().to_string()))
+    });
+
+    let cols = find_item_collisions(&out);
+    let warn = if warnings.is_empty() {
+        None
+    } else {
+        Some(warnings.join("；"))
+    };
+    (out, cols, warn)
 }
 
 /// Return {display_dst: [src_paths...]} for destinations targeted by >1 sources.
@@ -1027,6 +1284,7 @@ mod tests {
         );
         assert_eq!(detect_season(&["OVA".into(), "01.mkv".into()], "01.mkv", "Show"), 0);
         assert_eq!(detect_season(&["ep01.mkv".into()], "ep01.mkv", "Show 第二季"), 2);
+        assert!(is_extra_rel(&["爆炸".into(), "[DBD-Raws][Explosion][01].mkv".into()]));
     }
 
     #[test]
@@ -1140,6 +1398,7 @@ mod tests {
             false,
             None,
             None,
+            true,
         );
         assert!(cols_auto.is_empty());
         assert!(items_auto[0]
@@ -1155,11 +1414,139 @@ mod tests {
             false,
             None,
             Some(2),
+            true,
         );
         assert!(cols_forced.is_empty());
         let dst_str = items_forced[0].dst.to_string_lossy().replace('\\', "/");
         assert!(dst_str.ends_with("数码宝贝 (1999)/Season 02/数码宝贝 S02E46.mkv"), "got {}", dst_str);
 
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_reconcile_continuous_and_seasonal_offsets() {
+        // 1. Long-running continuous TMDB show (like One Piece) with drifted season folders & .5 recap
+        let items = vec![
+            RenameItem {
+                src: PathBuf::from("01.mkv"),
+                dst: PathBuf::from("/tmp/航海王 (1999)/Season 01/航海王 S01E01.mkv"),
+                kind: ItemKind::Main,
+            },
+            RenameItem {
+                src: PathBuf::from("61.mkv"),
+                dst: PathBuf::from("/tmp/航海王 (1999)/Season 01/航海王 S01E61.mkv"),
+                kind: ItemKind::Main,
+            },
+            RenameItem {
+                src: PathBuf::from("62.mkv"),
+                dst: PathBuf::from("/tmp/航海王 (1999)/Season 02/航海王 S02E62.mkv"),
+                kind: ItemKind::Main,
+            },
+            RenameItem {
+                src: PathBuf::from("892.mkv"),
+                dst: PathBuf::from("/tmp/航海王 (1999)/Season 20/航海王 S20E892.mkv"),
+                kind: ItemKind::Main,
+            },
+            RenameItem {
+                src: PathBuf::from("1073.5.mkv"),
+                dst: PathBuf::from("/tmp/航海王 (1999)/Season 20/航海王 S20E1073.5.mkv"),
+                kind: ItemKind::Main,
+            },
+        ];
+
+        let seasons_map = |_tid| {
+            let mut m = HashMap::new();
+            m.insert(1, "第1季 东海篇".to_string());
+            m.insert(2, "第2季 伟大航路突入篇".to_string());
+            m.insert(20, "第20季 世界会议篇".to_string());
+            m.insert(21, "第21季 和之国篇".to_string());
+            Ok(m)
+        };
+        let ep_fetcher = |_tid, s| {
+            let mut m = HashMap::new();
+            match s {
+                1 => {
+                    m.insert(1, "我是路飞！".into());
+                    m.insert(61, "愤怒的结局！".into());
+                }
+                2 => {
+                    m.insert(62, "第一道障碍？".into());
+                }
+                20 => {
+                    m.insert(878, "世界震惊".into());
+                }
+                21 => {
+                    m.insert(892, "和之国".into());
+                    m.insert(1073, "无路可逃！".into());
+                }
+                _ => {}
+            }
+            Ok(m)
+        };
+
+        let (rec, cols, warn) = reconcile_tv_episodes(items, seasons_map, ep_fetcher, 37854);
+        assert!(cols.is_empty() && warn.is_none());
+        let (titled, cols2, _) = attach_episode_titles(rec, ep_fetcher, 37854);
+        assert!(cols2.is_empty());
+
+        let paths: Vec<String> = titled
+            .iter()
+            .map(|x| x.dst.to_string_lossy().replace('\\', "/"))
+            .collect();
+        assert!(paths.iter().any(|p| p.ends_with("Season 02/航海王 S02E62 [第一道障碍？].mkv")), "{:?}", paths);
+        assert!(paths.iter().any(|p| p.ends_with("Season 21/航海王 S21E892 [和之国].mkv")), "{:?}", paths);
+        assert!(paths.iter().any(|p| p.ends_with("Season 21/航海王 S21E1073.5.mkv")), "{:?}", paths);
+
+        // 2. Standard 1-based seasonal TMDB show where local Season 2 used absolute numbering 13..14
+        let s_items = vec![
+            RenameItem {
+                src: PathBuf::from("12.mkv"),
+                dst: PathBuf::from("/tmp/Show (2020)/Season 01/Show S01E12.mkv"),
+                kind: ItemKind::Main,
+            },
+            RenameItem {
+                src: PathBuf::from("13.mkv"),
+                dst: PathBuf::from("/tmp/Show (2020)/Season 02/Show S02E13.mkv"),
+                kind: ItemKind::Main,
+            },
+        ];
+        let (s_rec, _, _) = reconcile_tv_episodes(
+            s_items,
+            |_| Ok(HashMap::from([(1, "第1季".into()), (2, "第2季".into())])),
+            |_, s| {
+                if s == 1 {
+                    Ok(HashMap::from([(1, "Ep1".into()), (12, "Ep12".into())]))
+                } else {
+                    Ok(HashMap::from([(1, "S2Ep1".into()), (2, "S2Ep2".into())]))
+                }
+            },
+            999,
+        );
+        assert!(s_rec.iter().any(|x| x.dst.to_string_lossy().ends_with("Show S02E01.mkv")));
+    }
+
+    #[test]
+    fn test_decimal_ep_preserves_explicit_season() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let root = std::env::temp_dir().join(format!("tmdb_renamer_dec_{}", stamp));
+        let s20 = root.join("海贼王 (1999)").join("Season 20");
+        fs::create_dir_all(&s20).unwrap();
+        fs::write(s20.join("海贼王 S20E1073.5.mkv"), b"").unwrap();
+        let (items, _) = build_multi_folder_items(
+            std::slice::from_ref(&root.join("海贼王 (1999)")),
+            &root,
+            "航海王 (1999)",
+            "tv",
+            false,
+            None,
+            None,
+            false,
+        );
+        let dst = items[0].dst.to_string_lossy().replace('\\', "/");
+        assert!(dst.ends_with("Season 20/航海王 S20E1073.5.mkv"), "got {}", dst);
         let _ = fs::remove_dir_all(&root);
     }
 }

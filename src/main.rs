@@ -23,8 +23,8 @@ mod gui {
     use tmdb_renamer::config::AppConfig;
     use tmdb_renamer::parser_rules::{
         attach_episode_titles, attach_season_names, build_multi_folder_items, clean_query_name,
-        find_collision_map, norm_path_str, path_key, prune_empty_dirs, safe_move,
-        validate_all_plans, FolderPlan, ItemKind,
+        find_collision_map, norm_path_str, path_key, prune_empty_dirs, reconcile_tv_episodes,
+        safe_move, validate_all_plans, FolderPlan, ItemKind, RenameItem,
     };
     use tmdb_renamer::tmdb_client::{TMDBClient, TMDBMatch};
 
@@ -227,6 +227,83 @@ mod gui {
             moved: usize,
             errors: Vec<String>,
         },
+    }
+
+    fn has_multi_seasons(items: &[RenameItem]) -> bool {
+        let mut seasons = HashSet::new();
+        for it in items {
+            if it.kind == ItemKind::Main {
+                if let Some(sf) = it.dst.parent().and_then(|p| p.file_name()).and_then(|s| s.to_str()) {
+                    if sf.starts_with("Season ") && sf != "Season 00" {
+                        seasons.insert(sf.to_string());
+                        if seasons.len() > 1 {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    fn finalize_tv_plan_items(
+        client: &TMDBClient,
+        items: &mut Vec<RenameItem>,
+        collisions: &mut Vec<String>,
+        tmdb_id: i64,
+        season_override: Option<i32>,
+        append_ep_title: bool,
+        append_season_name: bool,
+    ) -> Option<String> {
+        if tmdb_id == 0 || items.is_empty() {
+            return None;
+        }
+        let mut warns: Vec<String> = Vec::new();
+        if season_override.is_none() && (append_ep_title || has_multi_seasons(items)) {
+            let old_items = std::mem::take(items);
+            let (new_items, new_cols, w) = reconcile_tv_episodes(
+                old_items,
+                |tid| client.get_seasons_names(tid),
+                |tid, s| client.get_season_episodes(tid, s),
+                tmdb_id,
+            );
+            *items = new_items;
+            *collisions = new_cols;
+            if let Some(msg) = w {
+                warns.push(msg);
+            }
+        }
+        if append_ep_title {
+            let old_items = std::mem::take(items);
+            let (new_items, new_cols, w) = attach_episode_titles(
+                old_items,
+                |tid, s| client.get_season_episodes(tid, s),
+                tmdb_id,
+            );
+            *items = new_items;
+            *collisions = new_cols;
+            if let Some(msg) = w {
+                warns.push(msg);
+            }
+        }
+        if append_season_name {
+            let old_items = std::mem::take(items);
+            let (new_items, new_cols, w) = attach_season_names(
+                old_items,
+                |tid| client.get_seasons_names(tid),
+                tmdb_id,
+            );
+            *items = new_items;
+            *collisions = new_cols;
+            if let Some(msg) = w {
+                warns.push(msg);
+            }
+        }
+        if warns.is_empty() {
+            None
+        } else {
+            Some(warns.join("；"))
+        }
     }
 
     struct ManualModal {
@@ -547,6 +624,7 @@ mod gui {
                                 archive_extras,
                                 ex_opt,
                                 None,
+                                best.media_type != "tv" || best.tmdb_id == 0,
                             );
                             let status = if !cols.is_empty() {
                                 format!("⚠ 命名冲突 ({})", cols.len())
@@ -632,6 +710,7 @@ mod gui {
                         archive_extras,
                         ex_opt,
                         None,
+                        false,
                     );
                     let status = if !cols.is_empty() {
                         format!("⚠ 命名冲突 ({})", cols.len())
@@ -677,6 +756,7 @@ mod gui {
                         archive_extras,
                         ex_opt,
                         None,
+                        false,
                     );
                     only.src_dir = media_dir.clone();
                     only.src_dirs = vec![media_dir.clone()];
@@ -695,35 +775,21 @@ mod gui {
                     };
                 }
 
-                if append_ep_title || append_season_name {
-                    for mp in &mut merged_plans {
-                        if mp.tmdb_id != 0 && mp.media_type == "tv" && !mp.items.is_empty() {
-                            if append_ep_title {
-                                let old_items = std::mem::take(&mut mp.items);
-                                let (new_items, new_cols, warn) = attach_episode_titles(
-                                    old_items,
-                                    |tid, s| client.get_season_episodes(tid, s),
-                                    mp.tmdb_id,
-                                );
-                                mp.items = new_items;
-                                mp.collisions = new_cols;
-                                if let Some(w) = warn {
-                                    warnings.push(format!("{}: {}", mp.display_title, w));
-                                }
-                            }
-                            if append_season_name {
-                                let old_items = std::mem::take(&mut mp.items);
-                                let (new_items, new_cols, warn) = attach_season_names(
-                                    old_items,
-                                    |tid| client.get_seasons_names(tid),
-                                    mp.tmdb_id,
-                                );
-                                mp.items = new_items;
-                                mp.collisions = new_cols;
-                                if let Some(w) = warn {
-                                    warnings.push(format!("{}: {}", mp.display_title, w));
-                                }
-                            }
+                for mp in &mut merged_plans {
+                    if mp.tmdb_id != 0 && mp.media_type == "tv" && !mp.items.is_empty() {
+                        if let Some(w) = finalize_tv_plan_items(
+                            &client,
+                            &mut mp.items,
+                            &mut mp.collisions,
+                            mp.tmdb_id,
+                            mp.season_override,
+                            append_ep_title,
+                            append_season_name,
+                        ) {
+                            warnings.push(format!("{}: {}", mp.display_title, w));
+                        }
+                        if !mp.collisions.is_empty() {
+                            mp.status = format!("⚠ 命名冲突 ({})", mp.collisions.len());
                         }
                     }
                 }
@@ -857,32 +923,20 @@ mod gui {
                     archive_extras,
                     ex_opt,
                     eff_season,
+                    choice.media_type != "tv" || choice.tmdb_id == 0,
                 );
                 let mut warns: Vec<String> = Vec::new();
                 if choice.media_type == "tv" && !items.is_empty() {
-                    if append_ep_title {
-                        let (ni, nc, w) = attach_episode_titles(
-                            items,
-                            |tid, s| client.get_season_episodes(tid, s),
-                            choice.tmdb_id,
-                        );
-                        items = ni;
-                        cols = nc;
-                        if let Some(msg) = w {
-                            warns.push(msg);
-                        }
-                    }
-                    if append_season_name {
-                        let (ni, nc, w) = attach_season_names(
-                            items,
-                            |tid| client.get_seasons_names(tid),
-                            choice.tmdb_id,
-                        );
-                        items = ni;
-                        cols = nc;
-                        if let Some(msg) = w {
-                            warns.push(msg);
-                        }
+                    if let Some(msg) = finalize_tv_plan_items(
+                        &client,
+                        &mut items,
+                        &mut cols,
+                        choice.tmdb_id,
+                        eff_season,
+                        append_ep_title,
+                        append_season_name,
+                    ) {
+                        warns.push(msg);
                     }
                 }
                 plan.query = query;
