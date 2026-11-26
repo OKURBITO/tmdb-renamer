@@ -115,6 +115,23 @@ def is_extra_rel(rel_parts: List[str]) -> bool:
     return any(tag in fn_l for tag in EXTRA_FILE_TAGS)
 
 
+def find_collisions(items: List[RenameItem]) -> Dict[str, List[str]]:
+    """Return {dst_path: [src_paths...]} for any destination targeted by multiple sources."""
+    seen: Dict[str, List[str]] = {}
+    display_dst: Dict[str, str] = {}
+    for it in items:
+        k = os.path.normcase(it.dst)
+        seen.setdefault(k, []).append(it.src)
+        display_dst.setdefault(k, it.dst)
+    return {display_dst[k]: srcs for k, srcs in seen.items() if len(srcs) > 1}
+
+
+def extract_part_tag(fname: str) -> str:
+    """Preserve multi-part episode tags like 'Part1' / 'Part 2' to avoid collapsing split episodes."""
+    m = re.search(r"(?:^|[\s._-])Part\s*0*(\d+)\b", fname, re.I)
+    return f" - Part{m.group(1)}" if m else ""
+
+
 @dataclass
 class RenameItem:
     src: str
@@ -151,7 +168,7 @@ def build_folder_items(
     items: List[RenameItem] = []
 
     src_folder_name = os.path.basename(os.path.normpath(src_dir))
-    raw_tv_entries: List[Tuple[str, int, str, str]] = []
+    raw_tv_entries: List[Tuple[str, int, str, str, str]] = []
 
     for r, _dirs, files in os.walk(src_dir):
         for fname in sorted(files):
@@ -182,12 +199,13 @@ def build_folder_items(
                     continue
                 if "." in ep:
                     s = 0
-                raw_tv_entries.append((src_path, s, ep, full_ext))
+                part_tag = extract_part_tag(fname)
+                raw_tv_entries.append((src_path, s, ep, part_tag, full_ext))
 
     # Normalize continuous episode numbering across seasons (e.g. S2 starting at ep 13 after S1 1..12)
     if raw_tv_entries:
         season_eps: Dict[int, List[int]] = {}
-        for _, s, ep, _ in raw_tv_entries:
+        for _, s, ep, _, _ in raw_tv_entries:
             if s >= 1 and "." not in ep:
                 season_eps.setdefault(s, []).append(int(ep))
         offsets: Dict[int, int] = {}
@@ -197,7 +215,7 @@ def build_folder_items(
             if s > 1 and prev_max > 0 and mn == prev_max + 1:
                 offsets[s] = prev_max
             prev_max = mx
-        for src_path, s, ep, full_ext in raw_tv_entries:
+        for src_path, s, ep, part_tag, full_ext in raw_tv_entries:
             if s in offsets and "." not in ep:
                 ep_num = int(ep) - offsets[s]
                 ep_fmt = f"{ep_num:02d}"
@@ -213,14 +231,11 @@ def build_folder_items(
                 target_parent_dir,
                 safe_folder,
                 f"Season {s:02d}",
-                f"{base_title} S{s:02d}E{ep_fmt}{title_suffix}{full_ext}",
+                f"{base_title} S{s:02d}E{ep_fmt}{part_tag}{title_suffix}{full_ext}",
             )
             items.append(RenameItem(src=src_path, dst=dst_path, kind="main"))
 
-    seen: Dict[str, List[str]] = {}
-    for it in items:
-        seen.setdefault(os.path.normcase(it.dst), []).append(it.src)
-    collisions = [dst for dst, srcs in seen.items() if len(srcs) > 1]
+    collisions = list(find_collisions(items).keys())
     # Put main episodes/movies before extras so previews always show main media first
     items.sort(key=lambda x: (0 if x.kind == "main" else 1, x.dst))
     return items, collisions
@@ -239,7 +254,7 @@ def attach_episode_titles(
     for it in items:
         if it.kind == "main":
             bn = os.path.basename(it.dst)
-            m = re.search(r"(S(\d{2})E(\d{2,4})(?:\.\d)?)", bn)
+            m = re.search(r"(S(\d{2})E(\d{2,4})(?:\.\d)?(?:\s*-\s*Part\d+)?)", bn)
             if m:
                 s_num = int(m.group(2))
                 ep_num = int(m.group(3))
@@ -266,12 +281,7 @@ def attach_episode_titles(
                 continue
         out.append(it)
 
-    seen: Dict[str, int] = {}
-    for it in out:
-        k = os.path.normcase(it.dst)
-        seen[k] = seen.get(k, 0) + 1
-    collisions = [k for k, v in seen.items() if v > 1]
-    return out, collisions
+    return out, list(find_collisions(out).keys())
 
 
 def attach_season_names(
@@ -303,9 +313,4 @@ def attach_season_names(
                     continue
         out.append(it)
 
-    seen: Dict[str, int] = {}
-    for it in out:
-        k = os.path.normcase(it.dst)
-        seen[k] = seen.get(k, 0) + 1
-    collisions = [k for k, v in seen.items() if v > 1]
-    return out, collisions
+    return out, list(find_collisions(out).keys())

@@ -7,7 +7,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 from typing import Dict, List
 
-from parser_rules import FolderPlan, attach_episode_titles, attach_season_names, build_folder_items, clean_query_name
+from parser_rules import FolderPlan, attach_episode_titles, attach_season_names, build_folder_items, clean_query_name, find_collisions
 from tmdb_client import TMDBClient, TMDBMatch
 
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
@@ -125,6 +125,8 @@ class TMDBRenamerApp(tk.Tk):
         self.btn_scan = ttk.Button(act_frame, text="🔍 扫描并匹配 TMDB（预览）", command=self._on_scan)
         self.btn_scan.pack(side="left")
         ttk.Button(act_frame, text="✏️ 手动修改选中项 TMDB 匹配", command=self._on_edit_selected).pack(side="left", padx=8)
+        self.btn_conflicts = ttk.Button(act_frame, text="⚠️ 查看冲突详情", command=self._on_show_conflicts, state="disabled")
+        self.btn_conflicts.pack(side="left", padx=4)
         self.btn_exec = ttk.Button(act_frame, text="✅ 执行重命名", command=self._on_execute, state="disabled")
         self.btn_exec.pack(side="right")
 
@@ -155,14 +157,16 @@ class TMDBRenamerApp(tk.Tk):
         self.tree_folders.configure(yscrollcommand=sb1.set)
         self.tree_folders.pack(side="left", fill="both", expand=True)
         sb1.pack(side="right", fill="y")
+        self.tree_folders.tag_configure("conflict", foreground="#b00020", background="#fdecea")
         self.tree_folders.bind("<<TreeviewSelect>>", self._on_folder_select)
         self.tree_folders.bind("<Double-1>", lambda _e: self._on_edit_selected())
         paned.add(top_box, weight=3)
 
         # Bottom tree: File-level preview
-        bot_box = ttk.LabelFrame(paned, text="3. 选中作品的文件级重命名预览（改名前 → 改名后）", padding=4)
+        bot_box = ttk.LabelFrame(paned, text="3. 选中作品的文件级重命名预览（改名前 → 改名后；冲突项置顶标红）", padding=4)
         fcols = ("kind", "src", "dst")
         self.tree_files = ttk.Treeview(bot_box, columns=fcols, show="headings", height=10)
+        self.tree_files.tag_configure("conflict", foreground="#b00020", background="#fdecea")
         self.tree_files.heading("kind", text="分类")
         self.tree_files.column("kind", width=70, anchor="center")
         self.tree_files.heading("src", text="改名前路径")
@@ -402,7 +406,8 @@ class TMDBRenamerApp(tk.Tk):
                 if x.kind == "main" and os.path.basename(os.path.dirname(x.dst)).startswith("Season ")
             })
             seasons_disp = ", ".join(seasons) if seasons else "-"
-            self.tree_folders.insert("", "end", iid=str(idx), values=(
+            row_tags = ("conflict",) if p.collisions else ()
+            self.tree_folders.insert("", "end", iid=str(idx), tags=row_tags, values=(
                 p.folder_name, p.display_title, seasons_disp, p.media_type, p.tmdb_id or "-", f"{m_cnt} / {e_cnt}", p.status
             ))
         if plans:
@@ -416,18 +421,71 @@ class TMDBRenamerApp(tk.Tk):
     def _on_folder_select(self, _event=None):
         sel = self.tree_folders.selection()
         if not sel:
+            self.btn_conflicts.config(state="disabled")
             return
         idx = int(sel[0])
         p = self.plans[idx]
+        conflict_map = find_collisions(p.items)
+        conflict_keys = {os.path.normcase(k) for k in conflict_map}
+        self.btn_conflicts.config(state="normal" if conflict_map else "disabled")
+
         self.tree_files.delete(*self.tree_files.get_children())
-        # Always show all main media items first, then up to 200 extra items
-        mains = [it for it in p.items if it.kind == "main"]
-        extras = [it for it in p.items if it.kind == "extra"][:200]
-        for it in mains + extras:
+        conflict_items = [it for it in p.items if os.path.normcase(it.dst) in conflict_keys]
+        mains = [it for it in p.items if it.kind == "main" and os.path.normcase(it.dst) not in conflict_keys]
+        extras = [it for it in p.items if it.kind == "extra" and os.path.normcase(it.dst) not in conflict_keys][:200]
+        for it in conflict_items + mains + extras:
             rel_src = os.path.relpath(it.src, os.path.dirname(p.src_dir))
             rel_dst = os.path.relpath(it.dst, os.path.dirname(p.src_dir)) if it.kind == "main" else it.dst
-            tag = "正片/字幕" if it.kind == "main" else "特典归档"
-            self.tree_files.insert("", "end", values=(tag, rel_src, rel_dst))
+            is_conf = os.path.normcase(it.dst) in conflict_keys
+            tag = "⚠️ 冲突" if is_conf else ("正片/字幕" if it.kind == "main" else "特典归档")
+            row_tags = ("conflict",) if is_conf else ()
+            self.tree_files.insert("", "end", tags=row_tags, values=(tag, rel_src, rel_dst))
+
+    def _on_show_conflicts(self):
+        sel = self.tree_folders.selection()
+        if not sel:
+            return
+        p = self.plans[int(sel[0])]
+        conflict_map = find_collisions(p.items)
+        if not conflict_map:
+            messagebox.showinfo("冲突详情", "当前选中作品没有命名冲突。")
+            return
+
+        win = tk.Toplevel(self)
+        win.title(f"命名冲突详情 - {p.display_title}（共 {len(conflict_map)} 处冲突）")
+        win.geometry("860x520")
+        win.transient(self)
+
+        lines = [f"作品目录：{p.src_dir}", f"冲突目标数：{len(conflict_map)}", "=" * 72, ""]
+        base_dir = os.path.dirname(p.src_dir)
+        for i, (dst_path, srcs) in enumerate(sorted(conflict_map.items()), 1):
+            rel_dst = os.path.relpath(dst_path, base_dir)
+            lines.append(f"[冲突 #{i}] 目标路径相同：{rel_dst}")
+            for j, sp in enumerate(srcs, 1):
+                rel_src = os.path.relpath(sp, base_dir)
+                lines.append(f"  来源 {j}: {rel_src}")
+            lines.append("")
+        content = "\n".join(lines)
+
+        txt = tk.Text(win, wrap="none", font=("Consolas", 10))
+        ysb = ttk.Scrollbar(win, orient="vertical", command=txt.yview)
+        xsb = ttk.Scrollbar(win, orient="horizontal", command=txt.xview)
+        txt.configure(yscrollcommand=ysb.set, xscrollcommand=xsb.set)
+        txt.insert("1.0", content)
+        txt.config(state="disabled")
+
+        btn_bar = ttk.Frame(win, padding=6)
+        btn_bar.pack(side="bottom", fill="x")
+        def copy_text():
+            self.clipboard_clear()
+            self.clipboard_append(content)
+            messagebox.showinfo("已复制", "冲突详情已复制到剪贴板。", parent=win)
+        ttk.Button(btn_bar, text="📋 复制全部冲突详情", command=copy_text).pack(side="left")
+        ttk.Button(btn_bar, text="关闭", command=win.destroy).pack(side="right")
+
+        ysb.pack(side="right", fill="y")
+        xsb.pack(side="bottom", fill="x")
+        txt.pack(side="left", fill="both", expand=True)
 
     def _on_edit_selected(self):
         sel = self.tree_folders.selection()
@@ -482,7 +540,8 @@ class TMDBRenamerApp(tk.Tk):
             if x.kind == "main" and os.path.basename(os.path.dirname(x.dst)).startswith("Season ")
         })
         seasons_disp = ", ".join(seasons) if seasons else "-"
-        self.tree_folders.item(str(idx), values=(
+        row_tags = ("conflict",) if p.collisions else ()
+        self.tree_folders.item(str(idx), tags=row_tags, values=(
             p.folder_name, p.display_title, seasons_disp, p.media_type, p.tmdb_id, f"{m_cnt} / {e_cnt}", p.status
         ))
         self._on_folder_select()
