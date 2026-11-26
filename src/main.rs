@@ -550,6 +550,8 @@ mod gui {
                             );
                             let status = if !cols.is_empty() {
                                 format!("⚠ 命名冲突 ({})", cols.len())
+                            } else if items.is_empty() {
+                                "⚠ 未识别到媒体文件".to_string()
                             } else {
                                 "就绪".to_string()
                             };
@@ -892,6 +894,8 @@ mod gui {
                 plan.collisions = cols;
                 plan.status = if !plan.collisions.is_empty() {
                     format!("⚠ 命名冲突 ({})", plan.collisions.len())
+                } else if plan.items.is_empty() {
+                    "⚠ 未识别到媒体文件".to_string()
                 } else if let Some(fs) = eff_season {
                     format!("就绪 (指定 S{:02})", fs)
                 } else {
@@ -1357,7 +1361,7 @@ mod gui {
                                                     (pal.danger, pal.danger_soft)
                                                 } else if p.executed {
                                                     (pal.success, pal.success_soft)
-                                                } else if p.status.starts_with("未匹配") {
+                                                } else if p.status.starts_with("未匹配") || p.status.starts_with('⚠') {
                                                     (pal.warning, pal.warning_soft)
                                                 } else {
                                                     (pal.success, pal.success_soft)

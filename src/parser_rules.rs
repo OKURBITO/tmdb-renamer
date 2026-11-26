@@ -367,7 +367,7 @@ fn is_special_folder_name(text: &str) -> bool {
 
 pub fn detect_season(rel_parts: &[String], fname: &str, root_folder_name: &str) -> i32 {
     static RE_SXE: OnceLock<Regex> = OnceLock::new();
-    let re_sxe = RE_SXE.get_or_init(|| Regex::new(r"(?i)(?:^|[^A-Za-z])S0*(\d{1,2})E\d{1,4}(?:\.\d)?(?:[^A-Za-z0-9]|$)").unwrap());
+    let re_sxe = RE_SXE.get_or_init(|| Regex::new(r"(?i)(?:^|[^A-Za-z])S0*(\d{1,2})E\d{1,4}(?:\.\d)?(?:v\d+)?(?:[^A-Za-z0-9]|$)").unwrap());
     if let Some(c) = re_sxe.captures(fname) {
         if let Ok(s) = c[1].parse::<i32>() {
             return s;
@@ -419,7 +419,7 @@ pub fn extract_episode(fname: &str) -> Option<String> {
 
     let (stem, _) = split_media_ext(fname);
 
-    let re_sxe = RE_SXE.get_or_init(|| Regex::new(r"(?i)(?:^|[^A-Za-z])S\d{1,2}E(\d{1,4}(?:\.\d)?)(?:[^A-Za-z0-9]|$)").unwrap());
+    let re_sxe = RE_SXE.get_or_init(|| Regex::new(r"(?i)(?:^|[^A-Za-z])S\d{1,2}E(\d{1,4}(?:\.\d)?)(?:v\d+)?(?:[^A-Za-z0-9]|$)").unwrap());
     if let Some(c) = re_sxe.captures(&stem) {
         return Some(c[1].to_string());
     }
@@ -429,12 +429,12 @@ pub fn extract_episode(fname: &str) -> Option<String> {
         return Some(c[1].to_string());
     }
 
-    let re_ep = RE_EP.get_or_init(|| Regex::new(r"(?i)(?:^|[^A-Za-z])EP\.?\s*(\d{1,4}(?:\.\d)?)(?:[^A-Za-z0-9]|$)").unwrap());
+    let re_ep = RE_EP.get_or_init(|| Regex::new(r"(?i)(?:^|[^A-Za-z])EP\.?\s*(\d{1,4}(?:\.\d)?)(?:v\d+)?(?:[^A-Za-z0-9]|$)").unwrap());
     if let Some(c) = re_ep.captures(&stem) {
         return Some(c[1].to_string());
     }
 
-    let re_e2 = RE_E2.get_or_init(|| Regex::new(r"(?i)(?:^|[^A-Za-z])E(\d{2,4}(?:\.\d)?)(?:[^A-Za-z0-9]|$)").unwrap());
+    let re_e2 = RE_E2.get_or_init(|| Regex::new(r"(?i)(?:^|[^A-Za-z])E(\d{2,4}(?:\.\d)?)(?:v\d+)?(?:[^A-Za-z0-9]|$)").unwrap());
     if let Some(c) = re_e2.captures(&stem) {
         return Some(c[1].to_string());
     }
@@ -460,7 +460,7 @@ pub fn extract_episode(fname: &str) -> Option<String> {
         }
     }
 
-    let re_ld = RE_LEAD.get_or_init(|| Regex::new(r"^(\d{1,3}(?:\.\d)?)(?:[\s._-]|$)").unwrap());
+    let re_ld = RE_LEAD.get_or_init(|| Regex::new(r"^(\d{1,3}(?:\.\d)?)(?:v\d+)?(?:[\s._-]|$)").unwrap());
     if let Some(c) = re_ld.captures(&stem) {
         if is_plausible_ep(&c[1]) {
             return Some(c[1].to_string());
@@ -1035,6 +1035,17 @@ mod tests {
         assert_eq!(extract_episode("86 -Eighty Six- 01.mkv").as_deref(), Some("01"));
         assert_eq!(extract_episode("Show.S00E05.5.mkv").as_deref(), Some("05.5"));
         assert_eq!(extract_episode("第07集.mkv").as_deref(), Some("07"));
+        assert_eq!(
+            extract_episode("[Judas] Gintama - Mr. Ginpachi - S01E01v2.mkv").as_deref(),
+            Some("01")
+        );
+        assert_eq!(extract_episode("Show EP03v2.mkv").as_deref(), Some("03"));
+        assert_eq!(extract_episode("Show E12v3.mkv").as_deref(), Some("12"));
+        assert_eq!(extract_episode("04v2.mkv").as_deref(), Some("04"));
+        assert_eq!(
+            detect_season(&["[Judas] Gintama - Mr. Ginpachi - S02E01v2.mkv".into()], "[Judas] Gintama - Mr. Ginpachi - S02E01v2.mkv", "Show"),
+            2
+        );
         assert_eq!(extract_part_tag("Show S01E01 Part 2.mkv"), " - Part2");
         assert_eq!(extract_part_tag("Show S01E01.Part1.mkv"), " - Part1");
     }
