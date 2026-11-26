@@ -1,0 +1,11 @@
+{
+  "api_key": "",
+  "proxy": "",
+  "media_dir": "",
+  "extras_dir": "",
+  "archive_extras": true,
+  "append_ep_title": false,
+  "append_season_name": false,
+  "scan_mode": "batch",
+  "media_type": "auto"
+}

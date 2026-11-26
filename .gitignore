@@ -1,0 +1,13 @@
+# Local user configuration (contains TMDB API key / proxy / local paths)
+config.json
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# OS / Editor junk
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
