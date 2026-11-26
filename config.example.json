@@ -7,5 +7,6 @@
   "append_ep_title": false,
   "append_season_name": false,
   "scan_mode": "batch",
-  "media_type": "auto"
+  "media_type": "auto",
+  "dark_mode": true
 }

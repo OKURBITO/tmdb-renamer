@@ -1,13 +1,14 @@
-# Local user configuration (contains TMDB API key / proxy / local paths)
+/target/
+Cargo.lock.bak
+**/*.rs.bk
+
+# User secrets / runtime config
 config.json
+*.local.json
 
-# Python bytecode
-__pycache__/
-*.py[cod]
-*$py.class
-
-# OS / Editor junk
+# OS / IDE / Logs
 .DS_Store
 Thumbs.db
 .vscode/
 .idea/
+*.log
