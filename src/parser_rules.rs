@@ -65,6 +65,7 @@ pub struct FolderPlan {
     pub media_type: String, // "tv" or "movie"
     pub display_title: String,
     pub tmdb_id: i64,
+    pub season_override: Option<i32>,
     pub items: Vec<RenameItem>,
     pub collisions: Vec<String>,
     pub status: String,
@@ -539,6 +540,7 @@ pub fn build_multi_folder_items(
     media_type: &str,
     archive_extras: bool,
     extras_root_dir: Option<&Path>,
+    season_override: Option<i32>,
 ) -> (Vec<RenameItem>, Vec<String>) {
     static RE_YEAR_SUFFIX: OnceLock<Regex> = OnceLock::new();
     let safe_folder = sanitize_filename(target_folder_name, 160);
@@ -613,7 +615,6 @@ pub fn build_multi_folder_items(
                     kind: ItemKind::Main,
                 });
             } else {
-                let mut s = detect_season(&parts, &fname, &src_folder_name);
                 let ep = match extract_episode(&fname) {
                     Some(e) => e,
                     None => {
@@ -631,9 +632,15 @@ pub fn build_multi_folder_items(
                         continue;
                     }
                 };
-                if ep.contains('.') {
-                    s = 0;
-                }
+                let s = if let Some(forced_s) = season_override {
+                    forced_s
+                } else {
+                    let mut detected = detect_season(&parts, &fname, &src_folder_name);
+                    if ep.contains('.') {
+                        detected = 0;
+                    }
+                    detected
+                };
                 let part_tag = extract_part_tag(&fname);
                 raw_tv.push((src_path, s, ep, part_tag, full_ext));
             }
@@ -1099,5 +1106,49 @@ mod tests {
             out2[1].dst.parent().unwrap().file_name().unwrap().to_str().unwrap(),
             "Season 02"
         );
+    }
+
+    #[test]
+    fn test_season_override_overrides_filename_s01() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let root = std::env::temp_dir().join(format!("tmdb_renamer_season_override_{}", stamp));
+        let src_dir = root.join("数码宝贝大冒险02 (2000)");
+        let s02_dir = src_dir.join("Season 02");
+        fs::create_dir_all(&s02_dir).unwrap();
+        let sample = s02_dir.join("数码宝贝大冒险02 S01E46.mkv");
+        fs::write(&sample, b"").unwrap();
+
+        let (items_auto, cols_auto) = build_multi_folder_items(
+            std::slice::from_ref(&src_dir),
+            &root,
+            "数码宝贝 (1999)",
+            "tv",
+            false,
+            None,
+            None,
+        );
+        assert!(cols_auto.is_empty());
+        assert!(items_auto[0]
+            .dst
+            .to_string_lossy()
+            .contains("Season 01"));
+
+        let (items_forced, cols_forced) = build_multi_folder_items(
+            std::slice::from_ref(&src_dir),
+            &root,
+            "数码宝贝 (1999)",
+            "tv",
+            false,
+            None,
+            Some(2),
+        );
+        assert!(cols_forced.is_empty());
+        let dst_str = items_forced[0].dst.to_string_lossy().replace('\\', "/");
+        assert!(dst_str.ends_with("数码宝贝 (1999)/Season 02/数码宝贝 S02E46.mkv"), "got {}", dst_str);
+
+        let _ = fs::remove_dir_all(&root);
     }
 }

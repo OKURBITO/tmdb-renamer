@@ -232,6 +232,9 @@ mod gui {
     struct ManualModal {
         idx: usize,
         query: String,
+        season_override: Option<i32>,
+        season_input: i32,
+        current_match: Option<TMDBMatch>,
         searching: bool,
         matches: Vec<TMDBMatch>,
         error: Option<String>,
@@ -526,6 +529,7 @@ mod gui {
                                 media_type: "tv".to_string(),
                                 display_title: fname,
                                 tmdb_id: 0,
+                                season_override: None,
                                 items: Vec::new(),
                                 collisions: Vec::new(),
                                 status: format!("请求出错: {}", ex),
@@ -542,6 +546,7 @@ mod gui {
                                 &best.media_type,
                                 archive_extras,
                                 ex_opt,
+                                None,
                             );
                             let status = if !cols.is_empty() {
                                 format!("⚠ 命名冲突 ({})", cols.len())
@@ -558,6 +563,7 @@ mod gui {
                                 media_type: best.media_type.clone(),
                                 display_title: display,
                                 tmdb_id: best.tmdb_id,
+                                season_override: None,
                                 items,
                                 collisions: cols,
                                 status,
@@ -575,6 +581,7 @@ mod gui {
                                 media_type: "tv".to_string(),
                                 display_title: fname,
                                 tmdb_id: 0,
+                                season_override: None,
                                 items: Vec::new(),
                                 collisions: Vec::new(),
                                 status: "未匹配（双击手搜）".to_string(),
@@ -622,6 +629,7 @@ mod gui {
                         "tv",
                         archive_extras,
                         ex_opt,
+                        None,
                     );
                     let status = if !cols.is_empty() {
                         format!("⚠ 命名冲突 ({})", cols.len())
@@ -643,6 +651,7 @@ mod gui {
                         media_type: "tv".to_string(),
                         display_title: first.display_title.clone(),
                         tmdb_id: tid,
+                        season_override: None,
                         items,
                         collisions: cols,
                         status,
@@ -665,6 +674,7 @@ mod gui {
                         &only.media_type,
                         archive_extras,
                         ex_opt,
+                        None,
                     );
                     only.src_dir = media_dir.clone();
                     only.src_dirs = vec![media_dir.clone()];
@@ -734,9 +744,24 @@ mod gui {
                     self.show_popup("提示", "该条目已执行重命名，如需继续整理请重新扫描。".to_string());
                     return;
                 }
+                let current_match = if p.tmdb_id != 0 {
+                    Some(TMDBMatch {
+                        tmdb_id: p.tmdb_id,
+                        media_type: p.media_type.clone(),
+                        title: p.display_title.clone(),
+                        original_title: String::new(),
+                        year: String::new(),
+                        overview: String::new(),
+                    })
+                } else {
+                    None
+                };
                 self.manual_modal = Some(ManualModal {
                     idx,
                     query: p.query.clone(),
+                    season_override: p.season_override,
+                    season_input: p.season_override.unwrap_or(2),
+                    current_match,
                     searching: false,
                     matches: Vec::new(),
                     error: None,
@@ -781,7 +806,14 @@ mod gui {
             });
         }
 
-        fn apply_manual_choice(&mut self, idx: usize, query: String, choice: TMDBMatch, ctx: egui::Context) {
+        fn apply_manual_choice(
+            &mut self,
+            idx: usize,
+            query: String,
+            choice: TMDBMatch,
+            season_override: Option<i32>,
+            ctx: egui::Context,
+        ) {
             let mut plan = match self.plans.get(idx) {
                 Some(p) => p.clone(),
                 None => return,
@@ -796,6 +828,12 @@ mod gui {
             self.manual_modal = None;
             self.busy = true;
             self.status = format!("正在生成预览: {}...", choice.display_name());
+
+            let eff_season = if choice.media_type == "movie" {
+                None
+            } else {
+                season_override
+            };
 
             let archive_extras = self.cfg.archive_extras;
             let append_ep_title = self.cfg.append_ep_title;
@@ -816,6 +854,7 @@ mod gui {
                     &choice.media_type,
                     archive_extras,
                     ex_opt,
+                    eff_season,
                 );
                 let mut warns: Vec<String> = Vec::new();
                 if choice.media_type == "tv" && !items.is_empty() {
@@ -848,10 +887,13 @@ mod gui {
                 plan.media_type = choice.media_type.clone();
                 plan.display_title = choice.display_name();
                 plan.tmdb_id = choice.tmdb_id;
+                plan.season_override = eff_season;
                 plan.items = items;
                 plan.collisions = cols;
                 plan.status = if !plan.collisions.is_empty() {
                     format!("⚠ 命名冲突 ({})", plan.collisions.len())
+                } else if let Some(fs) = eff_season {
+                    format!("就绪 (指定 S{:02})", fs)
                 } else {
                     "就绪".to_string()
                 };
@@ -1480,21 +1522,74 @@ mod gui {
 
             // Manual TMDB Search Modal
             let mut trigger_search = false;
-            let mut chosen: Option<(usize, String, TMDBMatch)> = None;
+            let mut chosen: Option<(usize, String, TMDBMatch, Option<i32>)> = None;
             let mut close_modal = false;
 
             if let Some(modal) = &mut self.manual_modal {
-                egui::Window::new("手动搜索 TMDB")
+                egui::Window::new("手动修正匹配 / 指定 Season")
                     .collapsible(false)
                     .resizable(true)
-                    .default_width(580.0)
+                    .default_width(620.0)
                     .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                     .show(ctx, |ui| {
+                        // Season override controls (for series folded under another season on TMDB)
+                        egui::Frame::none()
+                            .fill(pal.bg_subtle)
+                            .stroke(Stroke::new(1.0_f32, pal.border))
+                            .rounding(Rounding::same(8.0))
+                            .inner_margin(Margin::symmetric(10.0, 8.0))
+                            .show(ui, |ui| {
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.label(RichText::new("目标 Season").strong().size(12.5).color(pal.text_primary));
+                                    if segment_btn(ui, modal.season_override.is_none(), "自动识别", pal) {
+                                        modal.season_override = None;
+                                    }
+                                    if segment_btn(ui, modal.season_override.is_some(), "手动指定", pal) {
+                                        modal.season_override = Some(modal.season_input.clamp(0, 99));
+                                    }
+                                    for s in 0..=5 {
+                                        if segment_btn(ui, modal.season_override == Some(s), &format!("S{:02}", s), pal) {
+                                            modal.season_input = s;
+                                            modal.season_override = Some(s);
+                                        }
+                                    }
+                                    let dv = ui.add(
+                                        egui::DragValue::new(&mut modal.season_input)
+                                            .range(0..=99)
+                                            .prefix("Season "),
+                                    );
+                                    if dv.changed() {
+                                        modal.season_input = modal.season_input.clamp(0, 99);
+                                        modal.season_override = Some(modal.season_input);
+                                    }
+                                });
+                                if let Some(cur) = &modal.current_match {
+                                    if cur.media_type == "tv" {
+                                        ui.add_space(4.0);
+                                        ui.horizontal(|ui| {
+                                            let lbl = match modal.season_override {
+                                                Some(s) => format!("直接应用 Season {:02} 到当前条目（{}）", s, cur.title),
+                                                None => format!("恢复自动识别季号并刷新（{}）", cur.title),
+                                            };
+                                            if primary_btn(ui, true, &lbl, pal.success) {
+                                                chosen = Some((
+                                                    modal.idx,
+                                                    modal.query.clone(),
+                                                    cur.clone(),
+                                                    modal.season_override,
+                                                ));
+                                            }
+                                        });
+                                    }
+                                }
+                            });
+                        ui.add_space(6.0);
+
                         ui.horizontal(|ui| {
                             let resp = ui.add(
                                 egui::TextEdit::singleline(&mut modal.query)
                                     .hint_text("输入中文名、英文名或原名...")
-                                    .desired_width(430.0),
+                                    .desired_width(470.0),
                             );
                             if (resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
                                 || primary_btn(ui, !modal.searching, "搜索", pal.accent)
@@ -1517,7 +1612,7 @@ mod gui {
 
                         if !modal.matches.is_empty() {
                             ui.add_space(8.0);
-                            ui.label(RichText::new("点击选择要应用的 TMDB 条目：").color(pal.text_secondary).size(12.0));
+                            ui.label(RichText::new("点击选择要应用的 TMDB 条目（将同时应用上方 Season 设置）：").color(pal.text_secondary).size(12.0));
                             ui.add_space(4.0);
                             egui::ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
                                 for m in modal.matches.iter().take(10) {
@@ -1533,7 +1628,12 @@ mod gui {
                                                 ui.label(RichText::new(m.display_name()).strong().color(pal.text_primary));
                                                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                                     if primary_btn(ui, true, "选择", pal.success) {
-                                                        chosen = Some((modal.idx, modal.query.clone(), m.clone()));
+                                                        chosen = Some((
+                                                            modal.idx,
+                                                            modal.query.clone(),
+                                                            m.clone(),
+                                                            modal.season_override,
+                                                        ));
                                                     }
                                                     ui.label(
                                                         RichText::new(format!("ID: {}", m.tmdb_id))
@@ -1564,8 +1664,8 @@ mod gui {
             if trigger_search {
                 self.start_manual_search(ctx.clone());
             }
-            if let Some((idx, q, c)) = chosen {
-                self.apply_manual_choice(idx, q, c, ctx.clone());
+            if let Some((idx, q, c, s_ov)) = chosen {
+                self.apply_manual_choice(idx, q, c, s_ov, ctx.clone());
             }
             if close_modal {
                 self.manual_modal = None;
