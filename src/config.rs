@@ -15,6 +15,7 @@ pub struct AppConfig {
     pub scan_mode: String,  // "batch" | "single"
     pub media_type: String, // "auto" | "tv" | "movie"
     pub dark_mode: bool,
+    pub custom_extra_dirs: Vec<String>,
 }
 
 impl Default for AppConfig {
@@ -30,6 +31,7 @@ impl Default for AppConfig {
             scan_mode: "batch".to_string(),
             media_type: "auto".to_string(),
             dark_mode: true,
+            custom_extra_dirs: Vec::new(),
         }
     }
 }
@@ -40,6 +42,10 @@ impl AppConfig {
             .ok()
             .and_then(|p| p.parent().map(|d| d.join("config.json")))
             .unwrap_or_else(|| PathBuf::from("config.json"))
+    }
+
+    pub fn history_path() -> PathBuf {
+        Self::config_path().with_file_name("rename_history.jsonl")
     }
 
     pub fn load() -> Self {

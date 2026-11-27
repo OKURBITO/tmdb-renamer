@@ -8,5 +8,6 @@
   "append_season_name": false,
   "scan_mode": "batch",
   "media_type": "auto",
-  "dark_mode": true
+  "dark_mode": true,
+  "custom_extra_dirs": []
 }

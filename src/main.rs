@@ -23,7 +23,7 @@ mod gui {
 
     use tmdb_renamer::config::AppConfig;
     use tmdb_renamer::parser_rules::{
-        attach_episode_titles, attach_season_names, build_multi_folder_items, clean_query_name,
+        append_rename_history, attach_episode_titles, attach_season_names, build_multi_folder_items, clean_query_name,
         find_collision_map, norm_path_str, path_key, prune_empty_dirs, reconcile_tv_episodes,
         safe_move, validate_all_plans, FolderPlan, ItemKind, RenameItem,
     };
@@ -275,6 +275,26 @@ mod gui {
         for it in items {
             if it.kind == ItemKind::Main {
                 main_count += 1;
+                if let Some(bn) = it.dst.file_name().and_then(|s| s.to_str()) {
+                    let bytes = bn.as_bytes();
+                    for (pos, _) in bn.match_indices('E') {
+                        if pos >= 3
+                            && bytes[pos - 3] == b'S'
+                            && bytes[pos - 2].is_ascii_digit()
+                            && bytes[pos - 1].is_ascii_digit()
+                        {
+                            let digits: String = bn[pos + 1..]
+                                .chars()
+                                .take_while(|c| c.is_ascii_digit())
+                                .collect();
+                            if let Ok(ep_num) = digits.parse::<i32>() {
+                                if ep_num > 12 {
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                }
                 if let Some(sf) = it.dst.parent().and_then(|p| p.file_name()).and_then(|s| s.to_str()) {
                     if sf.starts_with("Season ") && sf != "Season 00" {
                         seasons.insert(sf.to_string());
@@ -381,6 +401,7 @@ mod gui {
         popup_title: Option<String>,
         popup_body: String,
         logo_tex: Option<egui::TextureHandle>,
+        cached_client: Option<(String, String, TMDBClient)>,
     }
 
     fn install_cjk_fonts(ctx: &egui::Context) {
@@ -461,7 +482,21 @@ mod gui {
                 popup_title: None,
                 popup_body: String::new(),
                 logo_tex,
+                cached_client: None,
             }
+        }
+
+        fn get_or_create_client(&mut self) -> Result<TMDBClient, String> {
+            let key = self.cfg.api_key.trim().to_string();
+            let proxy = self.cfg.proxy.trim().to_string();
+            if let Some((ck, cp, client)) = &self.cached_client {
+                if *ck == key && *cp == proxy {
+                    return Ok(client.clone());
+                }
+            }
+            let client = TMDBClient::new(&key, &proxy)?;
+            self.cached_client = Some((key, proxy, client.clone()));
+            Ok(client)
         }
 
         fn show_popup(&mut self, title: &str, body: String) {
@@ -540,7 +575,7 @@ mod gui {
 
         fn start_test_conn(&mut self, ctx: egui::Context) {
             self.cfg.save();
-            let client = match TMDBClient::new(&self.cfg.api_key, &self.cfg.proxy) {
+            let client = match self.get_or_create_client() {
                 Ok(c) => c,
                 Err(e) => {
                     self.show_popup("提示", e);
@@ -564,7 +599,7 @@ mod gui {
                 self.show_popup("提示", "请选择有效的待整理文件夹。".to_string());
                 return;
             }
-            let client = match TMDBClient::new(&self.cfg.api_key, &self.cfg.proxy) {
+            let client = match self.get_or_create_client() {
                 Ok(c) => c,
                 Err(e) => {
                     self.show_popup("提示", e);
@@ -583,6 +618,7 @@ mod gui {
             let append_ep_title = self.cfg.append_ep_title;
             let append_season_name = self.cfg.append_season_name;
             let extras_dir = norm_path_str(&self.cfg.extras_dir);
+            let custom_extra_dirs = self.cfg.custom_extra_dirs.clone();
             let tx = self.tx.clone();
 
             thread::spawn(move || {
@@ -667,6 +703,7 @@ mod gui {
                                 ex_opt,
                                 None,
                                 best.media_type != "tv" || best.tmdb_id == 0,
+                                &custom_extra_dirs,
                             );
                             let status = if !cols.is_empty() {
                                 format!("⚠ 命名冲突 ({})", cols.len())
@@ -753,6 +790,7 @@ mod gui {
                         ex_opt,
                         None,
                         false,
+                        &custom_extra_dirs,
                     );
                     let status = if !cols.is_empty() {
                         format!("⚠ 命名冲突 ({})", cols.len())
@@ -799,6 +837,7 @@ mod gui {
                         ex_opt,
                         None,
                         false,
+                        &custom_extra_dirs,
                     );
                     only.src_dir = media_dir.clone();
                     only.src_dirs = vec![media_dir.clone()];
@@ -893,7 +932,7 @@ mod gui {
                 }
                 None => return,
             };
-            let client = match TMDBClient::new(&self.cfg.api_key, &self.cfg.proxy) {
+            let client = match self.get_or_create_client() {
                 Ok(c) => c,
                 Err(e) => {
                     if let Some(m) = &mut self.manual_modal {
@@ -928,7 +967,7 @@ mod gui {
                 Some(p) => p.clone(),
                 None => return,
             };
-            let client = match TMDBClient::new(&self.cfg.api_key, &self.cfg.proxy) {
+            let client = match self.get_or_create_client() {
                 Ok(c) => c,
                 Err(e) => {
                     self.show_popup("提示", e);
@@ -949,6 +988,7 @@ mod gui {
             let append_ep_title = self.cfg.append_ep_title;
             let append_season_name = self.cfg.append_season_name;
             let extras_dir = norm_path_str(&self.cfg.extras_dir);
+            let custom_extra_dirs = self.cfg.custom_extra_dirs.clone();
             let tx = self.tx.clone();
 
             thread::spawn(move || {
@@ -966,6 +1006,7 @@ mod gui {
                     ex_opt,
                     eff_season,
                     choice.media_type != "tv" || choice.tmdb_id == 0,
+                    &custom_extra_dirs,
                 );
                 let mut warns: Vec<String> = Vec::new();
                 if choice.media_type == "tv" && !items.is_empty() {
@@ -1024,6 +1065,7 @@ mod gui {
             thread::spawn(move || {
                 let mut moved = 0usize;
                 let mut processed = 0usize;
+                let mut moved_records: Vec<(PathBuf, PathBuf)> = Vec::new();
                 let mut errors: Vec<String> = Vec::new();
                 let mut touched_dirs: BTreeSet<PathBuf> = BTreeSet::new();
                 let mut removed_dirs: Vec<PathBuf> = Vec::new();
@@ -1052,7 +1094,10 @@ mod gui {
                             }
                         }
                         match safe_move(&it.src, &it.dst) {
-                            Ok(true) => moved += 1,
+                            Ok(true) => {
+                                moved += 1;
+                                moved_records.push((it.src.clone(), it.dst.clone()));
+                            }
                             Ok(false) => {}
                             Err(e) => {
                                 plan_errs += 1;
@@ -1077,6 +1122,9 @@ mod gui {
                     };
                 }
 
+                if !moved_records.is_empty() {
+                    append_rename_history(&AppConfig::history_path(), &moved_records);
+                }
                 if moved > 0 || !removed_dirs.is_empty() {
                     notify_explorer_refresh(&touched_dirs, &removed_dirs);
                 }
@@ -1206,7 +1254,7 @@ mod gui {
                                         .strong()
                                         .color(pal.text_primary),
                                 );
-                                pill_badge(ui, "v2.2", pal.accent, pal.accent_soft);
+                                pill_badge(ui, concat!("v", env!("CARGO_PKG_VERSION")), pal.accent, pal.accent_soft);
                             });
                         });
 
@@ -1476,10 +1524,8 @@ mod gui {
                                             });
                                             row.col(|ui| { ui.colored_label(row_fg, format!("{} / {}", m_cnt, e_cnt)); });
                                             row.col(|ui| {
-                                                let (fg, bg) = if is_conf || p.status.starts_with("请求") {
+                                                let (fg, bg) = if is_conf || p.status.starts_with("请求") || p.status.contains("失败") {
                                                     (pal.danger, pal.danger_soft)
-                                                } else if p.executed {
-                                                    (pal.success, pal.success_soft)
                                                 } else if p.status.starts_with("未匹配") || p.status.starts_with('⚠') {
                                                     (pal.warning, pal.warning_soft)
                                                 } else {

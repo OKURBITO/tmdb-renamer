@@ -10,9 +10,9 @@ const SUB_EXT: &[&str] = &[".ass", ".ssa", ".srt", ".vtt", ".sub", ".idx", ".sup
 
 const EXTRA_DIRS: &[&str] = &[
     "cds", "scans", "fonts", "ncop&nced", "ncop", "nced", "pv", "pvs",
-    "menu", "menus", "previews", "preview", "music", "ost", "图集", "做饭",
-    "变身&技能 合集", "舞蹈", "谈话", "sps", "sp", "extras", "extra",
-    "特典映像", "特典", "总集篇", "广播剧", "特别动画", "影家剧场", "小菜一碟", "爆炸",
+    "menu", "menus", "previews", "preview", "music", "ost", "图集",
+    "sps", "sp", "extras", "extra",
+    "特典映像", "特典", "总集篇", "广播剧", "特别动画",
     "sample", "samples", "trailers", "trailer", "featurettes",
 ];
 
@@ -521,11 +521,18 @@ pub fn fmt_episode(ep_str: &str) -> String {
 }
 
 pub fn is_extra_rel(rel_parts: &[String]) -> bool {
+    is_extra_rel_with_custom(rel_parts, &[])
+}
+
+pub fn is_extra_rel_with_custom(rel_parts: &[String], custom_extra_dirs: &[String]) -> bool {
     static RE_EXTRA_WORD: OnceLock<Regex> = OnceLock::new();
     if rel_parts.len() > 1 {
         for p in &rel_parts[..rel_parts.len() - 1] {
             let pl = p.to_lowercase();
-            if EXTRA_DIRS.contains(&pl.as_str()) || pl.contains("[fonts]") {
+            if EXTRA_DIRS.contains(&pl.as_str())
+                || pl.contains("[fonts]")
+                || custom_extra_dirs.iter().any(|c| !c.trim().is_empty() && c.trim().to_lowercase() == pl)
+            {
                 return true;
             }
         }
@@ -571,6 +578,7 @@ pub fn build_multi_folder_items(
     extras_root_dir: Option<&Path>,
     season_override: Option<i32>,
     apply_continuous_offset: bool,
+    custom_extra_dirs: &[String],
 ) -> (Vec<RenameItem>, Vec<String>) {
     static RE_YEAR_SUFFIX: OnceLock<Regex> = OnceLock::new();
     let safe_folder = sanitize_filename(target_folder_name, 160);
@@ -621,7 +629,7 @@ pub fn build_multi_folder_items(
             };
 
             let is_media = VIDEO_EXT.contains(&ext_l.as_str()) || SUB_EXT.contains(&ext_l.as_str());
-            if is_extra_rel(&parts) || !is_media {
+            if is_extra_rel_with_custom(&parts, custom_extra_dirs) || !is_media {
                 if archive_extras {
                     if let Some(ex_root) = extras_root_dir {
                         if !ex_root.as_os_str().is_empty() {
@@ -869,18 +877,31 @@ where
     let mut relocations: HashMap<(i32, i32), i32> = HashMap::new();
 
     if !tmdb_is_continuous {
-        let mut prev_max = 0;
+        let mut prev_local_max = 0;
+        let mut prev_tmdb_max = 0;
         for (s, eps) in &season_eps {
             let mn = *eps.iter().min().unwrap_or(&0);
             let mx = *eps.iter().max().unwrap_or(&0);
-            if *s > 1 && prev_max > 0 && mn == prev_max + 1 {
-                if let Some(m) = tmdb_ep_maps.get(s) {
-                    if m.contains_key(&(mn - prev_max)) && !m.contains_key(&mn) {
-                        offsets.insert(*s, prev_max);
+            let tmdb_max = tmdb_ep_maps
+                .get(s)
+                .and_then(|m| m.keys().copied().max())
+                .unwrap_or(0);
+            if *s > 1 {
+                let candidate_off = if prev_tmdb_max > 0 && mn > prev_tmdb_max {
+                    Some(prev_tmdb_max)
+                } else if prev_local_max > 0 && mn == prev_local_max + 1 {
+                    Some(prev_local_max)
+                } else {
+                    None
+                };
+                if let (Some(off), Some(m)) = (candidate_off, tmdb_ep_maps.get(s)) {
+                    if m.contains_key(&(mn - off)) && !m.contains_key(&mn) {
+                        offsets.insert(*s, off);
                     }
                 }
             }
-            prev_max = mx;
+            prev_local_max = mx;
+            prev_tmdb_max = if tmdb_max > 0 { prev_tmdb_max + tmdb_max } else { 0 };
         }
 
         // Flat absolute pack (all in Season 01 with max_ep > TMDB S01 max) -> split across TMDB S01..SN
@@ -1310,7 +1331,21 @@ pub fn safe_move(src: &Path, dst: &Path) -> Result<bool, String> {
     match fs::rename(src, dst) {
         Ok(()) => Ok(true),
         Err(_) => {
-            fs::copy(src, dst).map_err(|e| format!("跨盘复制失败: {}", e))?;
+            // Atomic cross-drive / SMB copy via temporary file to prevent half-written files on interruption
+            let parent = dst.parent().unwrap_or_else(|| Path::new("."));
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let tmp_dst = parent.join(format!(".__tmdb_copy_tmp_{}__", stamp));
+            if let Err(e) = fs::copy(src, &tmp_dst) {
+                let _ = fs::remove_file(&tmp_dst);
+                return Err(format!("跨盘复制失败: {}", e));
+            }
+            if let Err(e) = fs::rename(&tmp_dst, dst) {
+                let _ = fs::remove_file(&tmp_dst);
+                return Err(format!("跨盘落盘重命名失败: {}", e));
+            }
             if let Err(e) = fs::remove_file(src) {
                 let _ = fs::remove_file(dst);
                 return Err(format!("删除源文件失败: {}", e));
@@ -1347,6 +1382,39 @@ pub fn prune_empty_dirs(src_dirs: &[PathBuf]) -> Vec<PathBuf> {
     removed
 }
 
+
+pub fn append_rename_history(history_path: &Path, moves: &[(PathBuf, PathBuf)]) {
+    if moves.is_empty() {
+        return;
+    }
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let entries: Vec<serde_json::Value> = moves
+        .iter()
+        .map(|(src, dst)| {
+            serde_json::json!({
+                "src": src.to_string_lossy(),
+                "dst": dst.to_string_lossy(),
+            })
+        })
+        .collect();
+    let line = serde_json::json!({
+        "timestamp_unix": ts,
+        "count": entries.len(),
+        "moves": entries,
+    });
+    if let Ok(mut file) = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(history_path)
+    {
+        use std::io::Write;
+        let _ = writeln!(file, "{}", line);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1381,7 +1449,8 @@ mod tests {
         );
         assert_eq!(detect_season(&["OVA".into(), "01.mkv".into()], "01.mkv", "Show"), 0);
         assert_eq!(detect_season(&["ep01.mkv".into()], "ep01.mkv", "Show 第二季"), 2);
-        assert!(is_extra_rel(&["爆炸".into(), "[DBD-Raws][Explosion][01].mkv".into()]));
+        assert!(!is_extra_rel(&["爆炸".into(), "[DBD-Raws][Explosion][01].mkv".into()]));
+        assert!(is_extra_rel_with_custom(&["爆炸".into(), "[DBD-Raws][Explosion][01].mkv".into()], &["爆炸".into()]));
     }
 
     #[test]
@@ -1496,6 +1565,7 @@ mod tests {
             None,
             None,
             true,
+            &[],
         );
         assert!(cols_auto.is_empty());
         assert!(items_auto[0]
@@ -1512,6 +1582,7 @@ mod tests {
             None,
             Some(2),
             true,
+            &[],
         );
         assert!(cols_forced.is_empty());
         let dst_str = items_forced[0].dst.to_string_lossy().replace('\\', "/");
@@ -1641,6 +1712,7 @@ mod tests {
             None,
             None,
             false,
+            &[],
         );
         let dst = items[0].dst.to_string_lossy().replace('\\', "/");
         assert!(dst.ends_with("Season 20/航海王 S20E1073.5.mkv"), "got {}", dst);
@@ -1674,6 +1746,7 @@ mod tests {
             None,
             None,
             false,
+            &[],
         );
         assert!(cols.is_empty());
 
@@ -1706,5 +1779,40 @@ mod tests {
         assert!(paths.iter().any(|p| p.ends_with("Season 03/银魂 S03E01 [S3E1].mkv")), "{:?}", paths);
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_reconcile_seasonal_offset_with_missing_episode() {
+        // S01 has 1..12, S02 starts at 14 (missing ep 13) -> should still offset by 12 to S02E02
+        let items = vec![
+            RenameItem {
+                src: PathBuf::from("12.mkv"),
+                dst: PathBuf::from("/tmp/Show (2020)/Season 01/Show S01E12.mkv"),
+                kind: ItemKind::Main,
+            },
+            RenameItem {
+                src: PathBuf::from("14.mkv"),
+                dst: PathBuf::from("/tmp/Show (2020)/Season 02/Show S02E14.mkv"),
+                kind: ItemKind::Main,
+            },
+        ];
+        let (rec, cols, _) = reconcile_tv_episodes(
+            items,
+            |_| Ok(HashMap::from([(1, "第1季".into()), (2, "第2季".into())])),
+            |_, s| {
+                if s == 1 {
+                    Ok((1..=12).map(|i| (i, format!("Ep{}", i))).collect())
+                } else {
+                    Ok((1..=12).map(|i| (i, format!("S2Ep{}", i))).collect())
+                }
+            },
+            888,
+        );
+        assert!(cols.is_empty());
+        assert!(
+            rec.iter().any(|x| x.dst.to_string_lossy().ends_with("Show S02E02.mkv")),
+            "{:?}",
+            rec.iter().map(|x| &x.dst).collect::<Vec<_>>()
+        );
     }
 }

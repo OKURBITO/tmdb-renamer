@@ -31,7 +31,7 @@ Ships as a single lightweight executable with zero runtime dependencies, dark/li
   - **Movies**: `Title (Year)/Title (Year).ext` (preserving multi-disc suffixes such as `-cd1`, `-part2`).
   - **Subtitle Pairing**: Detects `.ass`, `.ssa`, `.srt`, `.vtt`, etc., preserving language/forced suffixes (e.g., `.zh-CN.forced.srt`, `.sc.ass`) alongside the matched video file.
 - **Extras & Bonus Archiving**
-  - Automatically isolates bonus directories (`CDs`, `Scans`, `Fonts`, `NCOP&NCED`, `PV`, `menu`, `SPs`, `特典映像`, `爆炸`, etc.) into a dedicated archive path to prevent scraper pollution.
+  - Automatically isolates bonus directories (`CDs`, `Scans`, `Fonts`, `NCOP&NCED`, `PV`, `menu`, `SPs`, `特典映像`, etc., plus user-defined `custom_extra_dirs` in [`config.json`](config.example.json)) into a dedicated archive path to prevent scraper pollution.
 - **Interactive Preview & Safe Execution**
   - **Batch & Single Modes**: Auto-merges split season folders belonging to the same TMDB TV ID in batch mode, with side-by-side before/after file previews.
   - **Manual Match & Season Override**: Double-click any row (or click **Manual Match**) to re-search TMDB or override the target season (`S00`–`S99`) directly onto an existing match.
