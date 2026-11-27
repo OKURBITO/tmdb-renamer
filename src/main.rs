@@ -14,8 +14,9 @@ fn main() -> eframe::Result<()> {
 mod gui {
     use eframe::egui::{self, Color32, Margin, RichText, Rounding, Stroke, Vec2};
     use egui_extras::{Column, TableBuilder};
-    use std::collections::{HashMap, HashSet};
+    use std::collections::{BTreeSet, HashMap, HashSet};
     use std::fs;
+    use std::os::windows::ffi::OsStrExt;
     use std::path::{Path, PathBuf};
     use std::sync::mpsc::{self, Receiver, Sender};
     use std::thread;
@@ -27,6 +28,45 @@ mod gui {
         safe_move, validate_all_plans, FolderPlan, ItemKind, RenameItem,
     };
     use tmdb_renamer::tmdb_client::{TMDBClient, TMDBMatch};
+
+    #[link(name = "shell32")]
+    extern "system" {
+        fn SHChangeNotify(wEventId: i32, uFlags: u32, dwItem1: *const u16, dwItem2: *const u16);
+    }
+
+    fn sh_notify_path(event_id: i32, flags: u32, path: &Path) {
+        let wide: Vec<u16> = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        unsafe {
+            SHChangeNotify(event_id, flags, wide.as_ptr(), std::ptr::null());
+        }
+    }
+
+    /// Notify Windows File Explorer to invalidate stale directory views (especially on SMB UNC shares).
+    fn notify_explorer_refresh(updated_dirs: &BTreeSet<PathBuf>, removed_dirs: &[PathBuf]) {
+        const SHCNE_RMDIR: i32 = 0x0000_0010;
+        const SHCNE_UPDATEDIR: i32 = 0x0000_1000;
+        const SHCNF_PATHW: u32 = 0x0005;
+        const SHCNF_FLUSH: u32 = 0x1000;
+
+        for dp in removed_dirs {
+            sh_notify_path(SHCNE_RMDIR, SHCNF_PATHW, dp);
+        }
+        let mut iter = updated_dirs.iter().peekable();
+        while let Some(dir) = iter.next() {
+            if dir.exists() {
+                let flags = if iter.peek().is_none() {
+                    SHCNF_PATHW | SHCNF_FLUSH
+                } else {
+                    SHCNF_PATHW
+                };
+                sh_notify_path(SHCNE_UPDATEDIR, flags, dir);
+            }
+        }
+    }
 
     const APP_ICON_RGBA: &[u8] = include_bytes!("../assets/app_icon_64.rgba");
 
@@ -229,10 +269,12 @@ mod gui {
         },
     }
 
-    fn has_multi_seasons(items: &[RenameItem]) -> bool {
+    fn should_reconcile_tv(items: &[RenameItem]) -> bool {
         let mut seasons = HashSet::new();
+        let mut main_count = 0usize;
         for it in items {
             if it.kind == ItemKind::Main {
+                main_count += 1;
                 if let Some(sf) = it.dst.parent().and_then(|p| p.file_name()).and_then(|s| s.to_str()) {
                     if sf.starts_with("Season ") && sf != "Season 00" {
                         seasons.insert(sf.to_string());
@@ -243,7 +285,7 @@ mod gui {
                 }
             }
         }
-        false
+        main_count > 12
     }
 
     fn finalize_tv_plan_items(
@@ -259,7 +301,7 @@ mod gui {
             return None;
         }
         let mut warns: Vec<String> = Vec::new();
-        if season_override.is_none() && (append_ep_title || has_multi_seasons(items)) {
+        if season_override.is_none() && (append_ep_title || should_reconcile_tv(items)) {
             let old_items = std::mem::take(items);
             let (new_items, new_cols, w) = reconcile_tv_episodes(
                 old_items,
@@ -983,14 +1025,32 @@ mod gui {
                 let mut moved = 0usize;
                 let mut processed = 0usize;
                 let mut errors: Vec<String> = Vec::new();
+                let mut touched_dirs: BTreeSet<PathBuf> = BTreeSet::new();
+                let mut removed_dirs: Vec<PathBuf> = Vec::new();
 
                 for p in &mut plans_snapshot {
                     if !p.is_ready() {
                         continue;
                     }
+                    touched_dirs.insert(p.target_parent_dir.clone());
+                    for sd in &p.src_dirs {
+                        touched_dirs.insert(sd.clone());
+                        if let Some(sp) = sd.parent() {
+                            touched_dirs.insert(sp.to_path_buf());
+                        }
+                    }
                     let mut plan_errs = 0usize;
                     for it in &p.items {
                         processed += 1;
+                        if let Some(sp) = it.src.parent() {
+                            touched_dirs.insert(sp.to_path_buf());
+                        }
+                        if let Some(dp) = it.dst.parent() {
+                            touched_dirs.insert(dp.to_path_buf());
+                            if let Some(show_dir) = dp.parent() {
+                                touched_dirs.insert(show_dir.to_path_buf());
+                            }
+                        }
                         match safe_move(&it.src, &it.dst) {
                             Ok(true) => moved += 1,
                             Ok(false) => {}
@@ -1007,13 +1067,18 @@ mod gui {
                             ctx.request_repaint();
                         }
                     }
-                    prune_empty_dirs(&p.src_dirs);
+                    let pruned = prune_empty_dirs(&p.src_dirs);
+                    removed_dirs.extend(pruned);
                     p.executed = true;
                     p.status = if plan_errs == 0 {
                         "已完成".to_string()
                     } else {
                         format!("⚠ 部分失败 ({})", plan_errs)
                     };
+                }
+
+                if moved > 0 || !removed_dirs.is_empty() {
+                    notify_explorer_refresh(&touched_dirs, &removed_dirs);
                 }
 
                 let _ = tx.send(WorkerMsg::ExecDone {

@@ -416,7 +416,7 @@ fn is_plausible_ep(ep_str: &str) -> bool {
     true
 }
 
-pub fn extract_episode(fname: &str) -> Option<String> {
+pub fn extract_episode_range(fname: &str) -> (Option<String>, Option<i32>) {
     static RE_SXE: OnceLock<Regex> = OnceLock::new();
     static RE_CN: OnceLock<Regex> = OnceLock::new();
     static RE_EP: OnceLock<Regex> = OnceLock::new();
@@ -428,55 +428,75 @@ pub fn extract_episode(fname: &str) -> Option<String> {
 
     let (stem, _) = split_media_ext(fname);
 
-    let re_sxe = RE_SXE.get_or_init(|| Regex::new(r"(?i)(?:^|[^A-Za-z])S\d{1,2}E(\d{1,4}(?:\.\d)?)(?:v\d+)?(?:[^A-Za-z0-9]|$)").unwrap());
+    let parse_valid_end = |s_str: &str, m2: Option<regex::Match<'_>>| -> Option<i32> {
+        let e2: i32 = m2?.as_str().parse().ok()?;
+        let e1: i32 = s_str.parse().ok()?;
+        if e2 > e1 && e2 - e1 <= 12 && is_plausible_ep(&e2.to_string()) {
+            Some(e2)
+        } else {
+            None
+        }
+    };
+
+    let re_sxe = RE_SXE.get_or_init(|| Regex::new(r"(?i)(?:^|[^A-Za-z])S\d{1,2}E(\d{1,4}(?:\.\d)?)(?:-E?(\d{1,4}))?(?:v\d+)?(?:[^A-Za-z0-9]|$)").unwrap());
     if let Some(c) = re_sxe.captures(&stem) {
-        return Some(c[1].to_string());
+        let e1 = c[1].to_string();
+        let e2 = parse_valid_end(&e1, c.get(2));
+        return (Some(e1), e2);
     }
 
     let re_cn = RE_CN.get_or_init(|| Regex::new(r"第(\d{1,4}(?:\.\d)?)[话話集]").unwrap());
     if let Some(c) = re_cn.captures(&stem) {
-        return Some(c[1].to_string());
+        return (Some(c[1].to_string()), None);
     }
 
     let re_ep = RE_EP.get_or_init(|| Regex::new(r"(?i)(?:^|[^A-Za-z])EP\.?\s*(\d{1,4}(?:\.\d)?)(?:v\d+)?(?:[^A-Za-z0-9]|$)").unwrap());
     if let Some(c) = re_ep.captures(&stem) {
-        return Some(c[1].to_string());
+        return (Some(c[1].to_string()), None);
     }
 
-    let re_e2 = RE_E2.get_or_init(|| Regex::new(r"(?i)(?:^|[^A-Za-z])E(\d{2,4}(?:\.\d)?)(?:v\d+)?(?:[^A-Za-z0-9]|$)").unwrap());
+    let re_e2 = RE_E2.get_or_init(|| Regex::new(r"(?i)(?:^|[^A-Za-z])E(\d{2,4}(?:\.\d)?)(?:-E?(\d{1,4}))?(?:v\d+)?(?:[^A-Za-z0-9]|$)").unwrap());
     if let Some(c) = re_e2.captures(&stem) {
-        return Some(c[1].to_string());
+        let e1 = c[1].to_string();
+        let e2 = parse_valid_end(&e1, c.get(2));
+        return (Some(e1), e2);
     }
 
-    let re_dash = RE_DASH.get_or_init(|| Regex::new(r"(?i)\s-\s(\d{1,4}(?:\.\d)?)(?:v\d+)?(?:\s|\[|\(|_|\.|$)").unwrap());
+    let re_dash = RE_DASH.get_or_init(|| Regex::new(r"(?i)\s-\s(\d{1,4}(?:\.\d)?)(?:-E?(\d{1,4}))?(?:v\d+)?(?:\s|\[|\(|_|\.|$)").unwrap());
     if let Some(c) = re_dash.captures(&stem) {
         if is_plausible_ep(&c[1]) {
-            return Some(c[1].to_string());
+            let e1 = c[1].to_string();
+            let e2 = parse_valid_end(&e1, c.get(2));
+            return (Some(e1), e2);
         }
     }
 
     let re_br = RE_BRACKET.get_or_init(|| Regex::new(r"(?i)\[(\d{1,4}(?:\.\d)?)(?:v\d+)?\]").unwrap());
     for c in re_br.captures_iter(&stem) {
         if is_plausible_ep(&c[1]) {
-            return Some(c[1].to_string());
+            return (Some(c[1].to_string()), None);
         }
     }
 
     let re_tr = RE_TRAIL.get_or_init(|| Regex::new(r"(?i)(?:^|[\s._-])(\d{2,3}(?:\.\d)?)(?:v\d+)?(?:\s*[\[\(].*)?$").unwrap());
     if let Some(c) = re_tr.captures(&stem) {
         if is_plausible_ep(&c[1]) {
-            return Some(c[1].to_string());
+            return (Some(c[1].to_string()), None);
         }
     }
 
     let re_ld = RE_LEAD.get_or_init(|| Regex::new(r"^(\d{1,3}(?:\.\d)?)(?:v\d+)?(?:[\s._-]|$)").unwrap());
     if let Some(c) = re_ld.captures(&stem) {
         if is_plausible_ep(&c[1]) {
-            return Some(c[1].to_string());
+            return (Some(c[1].to_string()), None);
         }
     }
 
-    None
+    (None, None)
+}
+
+pub fn extract_episode(fname: &str) -> Option<String> {
+    extract_episode_range(fname).0
 }
 
 /// Preserve multi-part episode tags like 'Part1' / 'Part 2' to avoid collapsing split episodes.
@@ -559,7 +579,7 @@ pub fn build_multi_folder_items(
     let multi_src = src_dirs.len() > 1;
 
     let mut items: Vec<RenameItem> = Vec::new();
-    let mut raw_tv: Vec<(PathBuf, i32, String, String, String)> = Vec::new();
+    let mut raw_tv: Vec<(PathBuf, i32, String, Option<i32>, String, String)> = Vec::new();
 
     for src_dir in src_dirs {
         let src_folder_name = src_dir
@@ -625,9 +645,9 @@ pub fn build_multi_folder_items(
                     kind: ItemKind::Main,
                 });
             } else {
-                let ep = match extract_episode(&fname) {
-                    Some(e) => e,
-                    None => {
+                let (ep, ep_end) = match extract_episode_range(&fname) {
+                    (Some(e), e2) => (e, e2),
+                    (None, _) => {
                         if archive_extras {
                             if let Some(ex_root) = extras_root_dir {
                                 if !ex_root.as_os_str().is_empty() {
@@ -652,14 +672,14 @@ pub fn build_multi_folder_items(
                     detected
                 };
                 let part_tag = extract_part_tag(&fname);
-                raw_tv.push((src_path, s, ep, part_tag, full_ext));
+                raw_tv.push((src_path, s, ep, ep_end, part_tag, full_ext));
             }
         }
     }
 
     if !raw_tv.is_empty() {
         let mut season_eps: BTreeMap<i32, Vec<i32>> = BTreeMap::new();
-        for (_, s, ep, _, _) in &raw_tv {
+        for (_, s, ep, _, _, _) in &raw_tv {
             if *s >= 1 && !ep.contains('.') {
                 if let Ok(n) = ep.parse::<i32>() {
                     season_eps.entry(*s).or_default().push(n);
@@ -679,19 +699,26 @@ pub fn build_multi_folder_items(
             }
         }
 
-        for (src_path, s, ep, part_tag, full_ext) in raw_tv {
-            let ep_fmt = if let Some(&off) = offsets.get(&s) {
+        for (src_path, s, ep, ep_end, part_tag, full_ext) in raw_tv {
+            let (ep_fmt, end_suffix) = if let Some(&off) = offsets.get(&s) {
                 if !ep.contains('.') {
                     let n = ep.parse::<i32>().unwrap_or(0) - off;
-                    format!("{:02}", n)
+                    let end_s = ep_end
+                        .map(|e2| format!("-E{:02}", (e2 - off).max(1)))
+                        .unwrap_or_default();
+                    (format!("{:02}", n), end_s)
                 } else {
-                    fmt_episode(&ep)
+                    (fmt_episode(&ep), String::new())
                 }
             } else {
-                fmt_episode(&ep)
+                let end_s = ep_end.map(|e2| format!("-E{:02}", e2)).unwrap_or_default();
+                (fmt_episode(&ep), end_s)
             };
 
-            let dst_name = format!("{} S{:02}E{}{}{}", base_title, s, ep_fmt, part_tag, full_ext);
+            let dst_name = format!(
+                "{} S{:02}E{}{}{}{}",
+                base_title, s, ep_fmt, end_suffix, part_tag, full_ext
+            );
             let dst_path = target_parent_dir
                 .join(&safe_folder)
                 .join(format!("Season {:02}", s))
@@ -736,7 +763,7 @@ where
     }
 
     static RE_TOK: OnceLock<Regex> = OnceLock::new();
-    let re_tok = RE_TOK.get_or_init(|| Regex::new(r"S(\d{2})E(\d{2,4})(\.\d)?").unwrap());
+    let re_tok = RE_TOK.get_or_init(|| Regex::new(r"S(\d{2})E(\d{2,4})(\.\d)?(?:-E(\d{2,4}))?").unwrap());
 
     struct ParsedTok {
         start: usize,
@@ -744,6 +771,7 @@ where
         s_num: i32,
         ep_int: i32,
         dec: String,
+        ep_end: Option<i32>,
     }
 
     let mut local_seasons: BTreeSet<i32> = BTreeSet::new();
@@ -758,6 +786,7 @@ where
                     let full = c.get(0).unwrap();
                     if let (Ok(s_num), Ok(ep_int)) = (c[1].parse::<i32>(), c[2].parse::<i32>()) {
                         let dec = c.get(3).map(|m| m.as_str().to_string()).unwrap_or_default();
+                        let ep_end = c.get(4).and_then(|m| m.as_str().parse::<i32>().ok());
                         if s_num >= 1 {
                             local_seasons.insert(s_num);
                             if dec.is_empty() {
@@ -770,6 +799,7 @@ where
                             s_num,
                             ep_int,
                             dec,
+                            ep_end,
                         });
                     }
                 }
@@ -852,6 +882,74 @@ where
             }
             prev_max = mx;
         }
+
+        // Flat absolute pack (all in Season 01 with max_ep > TMDB S01 max) -> split across TMDB S01..SN
+        if local_seasons.len() == 1 && local_seasons.contains(&1) && tmdb_seasons.len() > 1 {
+            let local_max = season_eps
+                .get(&1)
+                .and_then(|v| v.iter().max().copied())
+                .unwrap_or(0);
+            let s1_max = tmdb_ep_maps
+                .get(&1)
+                .and_then(|m| m.keys().copied().max())
+                .unwrap_or(0);
+            if s1_max > 0 && local_max > s1_max {
+                for &ts in &tmdb_seasons {
+                    if let std::collections::hash_map::Entry::Vacant(e) = tmdb_ep_maps.entry(ts) {
+                        if let Ok(m) = season_fetcher(tmdb_id, ts) {
+                            e.insert(m);
+                        }
+                    }
+                }
+                let mut cum_ranges: Vec<(i32, i32, i32, i32)> = Vec::new();
+                let mut cum_off = 0i32;
+                let mut valid_chain = true;
+                for &ts in &tmdb_seasons {
+                    if let Some(m) = tmdb_ep_maps.get(&ts) {
+                        let ts_min = m.keys().copied().filter(|&k| k > 0).min().unwrap_or(0);
+                        let ts_max = m.keys().copied().filter(|&k| k > 0).max().unwrap_or(0);
+                        if ts_max <= 0 || ts_min != 1 {
+                            valid_chain = false;
+                            break;
+                        }
+                        cum_ranges.push((ts, cum_off + 1, cum_off + ts_max, cum_off));
+                        cum_off += ts_max;
+                    } else {
+                        valid_chain = false;
+                        break;
+                    }
+                }
+                if valid_chain && cum_off >= local_max {
+                    for &ep_int in season_eps.get(&1).into_iter().flatten() {
+                        if let Some(&(ts, _, _, c_off)) = cum_ranges
+                            .iter()
+                            .find(|&&(_, rs, re, _)| (rs..=re).contains(&ep_int))
+                        {
+                            if ts != 1 || c_off != 0 {
+                                relocations.insert((1, ep_int), ts);
+                                offsets.insert(ts, c_off);
+                            }
+                        }
+                    }
+                    // Also handle decimal recaps in flat pack if any
+                    for (_, hit) in &parsed {
+                        if let Some(p) = hit {
+                            if p.s_num == 1 && !p.dec.is_empty() {
+                                if let Some(&(ts, _, _, c_off)) = cum_ranges
+                                    .iter()
+                                    .find(|&&(_, rs, re, _)| (rs..=re).contains(&p.ep_int))
+                                {
+                                    if ts != 1 || c_off != 0 {
+                                        relocations.insert((1, p.ep_int), ts);
+                                        offsets.insert(ts, c_off);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     } else {
         let has_missing = parsed.iter().any(|(_, h)| {
             h.as_ref()
@@ -904,19 +1002,14 @@ where
     for (it, hit) in parsed {
         if let Some(p) = hit {
             let new_s = relocations.get(&(p.s_num, p.ep_int)).copied().unwrap_or(p.s_num);
-            let new_ep = if p.dec.is_empty() {
-                if let Some(&off) = offsets.get(&new_s) {
-                    (p.ep_int - off).max(1)
-                } else {
-                    p.ep_int
-                }
-            } else {
-                p.ep_int
-            };
+            let off = offsets.get(&new_s).copied().unwrap_or(0);
+            let new_ep = (p.ep_int - off).max(1);
+            let new_ep_end = p.ep_end.map(|e2| (e2 - off).max(1));
 
             if new_s != p.s_num || new_ep != p.ep_int {
                 let bn = it.dst.file_name().unwrap().to_string_lossy();
-                let new_tok = format!("S{:02}E{:02}{}", new_s, new_ep, p.dec);
+                let end_str = new_ep_end.map(|e2| format!("-E{:02}", e2)).unwrap_or_default();
+                let new_tok = format!("S{:02}E{:02}{}{}", new_s, new_ep, p.dec, end_str);
                 let new_bn = format!("{}{}{}", &bn[..p.start], new_tok, &bn[p.end..]);
 
                 let old_s_folder = format!("Season {:02}", p.s_num);
@@ -1051,7 +1144,7 @@ where
 
     static RE_SE: OnceLock<Regex> = OnceLock::new();
     let re_se = RE_SE.get_or_init(|| {
-        Regex::new(r"(S(\d{2})E(\d{2,4})(?:\s*-\s*Part\d+)?)(?:\s+\[[^\]]+\])?").unwrap()
+        Regex::new(r"(S(\d{2})E(\d{2,4})(?:-E\d{2,4})?(?:\s*-\s*Part\d+)?)(?:\s+\[[^\]]+\])?").unwrap()
     });
 
     let mut seasons_needed = BTreeSet::new();
@@ -1227,7 +1320,8 @@ pub fn safe_move(src: &Path, dst: &Path) -> Result<bool, String> {
     }
 }
 
-pub fn prune_empty_dirs(src_dirs: &[PathBuf]) {
+pub fn prune_empty_dirs(src_dirs: &[PathBuf]) -> Vec<PathBuf> {
+    let mut removed = Vec::new();
     for sdir in src_dirs {
         if !sdir.is_dir() {
             continue;
@@ -1241,13 +1335,16 @@ pub fn prune_empty_dirs(src_dirs: &[PathBuf]) {
             .collect();
         dirs.sort_by_key(|d| std::cmp::Reverse(d.components().count()));
         for dp in dirs {
-            if let Ok(mut rd) = fs::read_dir(&dp) {
-                if rd.next().is_none() {
-                    let _ = fs::remove_dir(&dp);
-                }
+            // Drop ReadDir handle before RemoveDirectoryW to avoid SMB STATUS_DELETE_PENDING / sharing glitches
+            let is_empty = fs::read_dir(&dp)
+                .map(|mut rd| rd.next().is_none())
+                .unwrap_or(false);
+            if is_empty && fs::remove_dir(&dp).is_ok() {
+                removed.push(dp);
             }
         }
     }
+    removed
 }
 
 #[cfg(test)]
@@ -1547,6 +1644,67 @@ mod tests {
         );
         let dst = items[0].dst.to_string_lossy().replace('\\', "/");
         assert!(dst.ends_with("Season 20/航海王 S20E1073.5.mkv"), "got {}", dst);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_flat_absolute_pack_splits_into_tmdb_seasons_like_gintama() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let root = std::env::temp_dir().join(format!("tmdb_renamer_gintama_{}", stamp));
+        let src = root.join("银魂");
+        fs::create_dir_all(&src).unwrap();
+        for name in [
+            "[Anime Time] Gintama - 001-002.mkv",
+            "[Anime Time] Gintama - 003.mkv",
+            "[Anime Time] Gintama - 050.mkv",
+            "[Anime Time] Gintama - 100.mkv",
+        ] {
+            fs::write(src.join(name), b"").unwrap();
+        }
+
+        let (items, cols) = build_multi_folder_items(
+            std::slice::from_ref(&src),
+            &root,
+            "银魂 (2006)",
+            "tv",
+            false,
+            None,
+            None,
+            false,
+        );
+        assert!(cols.is_empty());
+
+        let seasons_fn = |_tid| {
+            Ok(HashMap::from([
+                (1, "其之壹".into()),
+                (2, "其之贰".into()),
+                (3, "其之叁".into()),
+            ]))
+        };
+        let ep_fn = |_tid, s| match s {
+            1 => Ok((1..=49).map(|i| (i, format!("S1E{}", i))).collect()),
+            2 => Ok((1..=50).map(|i| (i, format!("S2E{}", i))).collect()),
+            3 => Ok((1..=51).map(|i| (i, format!("S3E{}", i))).collect()),
+            _ => Ok(HashMap::new()),
+        };
+
+        let (rec, cols2, warn) = reconcile_tv_episodes(items, seasons_fn, ep_fn, 57041);
+        assert!(cols2.is_empty() && warn.is_none());
+        let (titled, cols3, _) = attach_episode_titles(rec, ep_fn, 57041);
+        assert!(cols3.is_empty());
+
+        let paths: Vec<String> = titled
+            .iter()
+            .map(|x| x.dst.to_string_lossy().replace('\\', "/"))
+            .collect();
+        assert!(paths.iter().any(|p| p.ends_with("Season 01/银魂 S01E01-E02 [S1E1].mkv")), "{:?}", paths);
+        assert!(paths.iter().any(|p| p.ends_with("Season 01/银魂 S01E03 [S1E3].mkv")), "{:?}", paths);
+        assert!(paths.iter().any(|p| p.ends_with("Season 02/银魂 S02E01 [S2E1].mkv")), "{:?}", paths);
+        assert!(paths.iter().any(|p| p.ends_with("Season 03/银魂 S03E01 [S3E1].mkv")), "{:?}", paths);
+
         let _ = fs::remove_dir_all(&root);
     }
 }
